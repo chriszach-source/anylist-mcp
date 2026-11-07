@@ -26,13 +26,14 @@ Manage shopping lists and items.
 |-----------|------|----------|-------------|
 | `action` | enum | Yes | See actions below |
 | `list_name` | string | No | Target list (defaults to configured default) |
-| `name` | string | For item actions | Item name |
+| `name` | string | For item actions | Item name; the new store's or category's name for create_store and create_category |
 | `quantity` | number | No | Item quantity (add_item only, default 1) |
 | `notes` | string | No | Item notes (add_item only) |
 | `include_checked` | boolean | No | Include checked-off items (list_items only) |
 | `include_notes` | boolean | No | Include item notes in output (list_items only) |
-| `store_name` | string | No | Filter items by store (add_items, set_item_category only) |
-| `category` | string | No | Category for item (add_item only) |
+| `store_name` | string | No | add_item, add_items, set_item_store: store to assign (omit on set_item_store to clear). list_items: show only that store's items. set_item_price: set that store's price |
+| `category` | string | No | Category name as shown in AnyList, built-in or custom, or a built-in slug such as `dairy` (add_item, add_items, set_item_category). Applies to new items; use set_item_category for an item already on the list |
+| `price` | number | No | Price per item, e.g. 3.49 (set_item_price, add_item; 0 clears it). The item's main price unless store_name is given on set_item_price. Also accepted per entry in add_items |
 
 **Actions:**
 
@@ -44,7 +45,10 @@ Manage shopping lists and items.
 { "name": "shopping", "arguments": { "action": "list_items", "list_name": "Costco", "include_notes": true } }
 
 // Add an item
-{ "name": "shopping", "arguments": { "action": "add_item", "name": "Eggs", "quantity": 2, "notes": "organic", "store": "Costco"} }
+{ "name": "shopping", "arguments": { "action": "add_item", "name": "Eggs", "quantity": 2, "notes": "organic", "store_name": "Costco", "category": "Dairy", "price": 4.99 } }
+
+// List only the items assigned to one store
+{ "name": "shopping", "arguments": { "action": "list_items", "store_name": "Costco" } }
 
 // Check off an item (supports partial name matching)
 { "name": "shopping", "arguments": { "action": "check_item", "name": "Eggs" } }
@@ -61,10 +65,26 @@ Manage shopping lists and items.
 // Get recently added items for a list
 { "name": "shopping", "arguments": { "action": "get_recents" } }
 
-// Set store for an item
+// Set store for an item (omit store_name to clear it)
 { "name": "shopping", "arguments": { "action": "set_item_store", "name": "Milk", "store_name": "Costco" } }
 
-// Set category for an item
+// List stores, or add one
+{ "name": "shopping", "arguments": { "action": "list_stores" } }
+{ "name": "shopping", "arguments": { "action": "create_store", "name": "Trader Joe's" } }
+
+// List the list's categories (built-in and custom), or add a custom one
+{ "name": "shopping", "arguments": { "action": "list_categories" } }
+{ "name": "shopping", "arguments": { "action": "create_category", "name": "Bulk Bins" } }
+
+// Move an item already on the list to another category
+{ "name": "shopping", "arguments": { "action": "set_item_category", "name": "Milk", "category": "Dairy" } }
+
+// Set an item's main price, the one AnyList shows when the list isn't filtered
+// to a store. With store_name, set that store's price instead (AnyList shows it
+// only under that store's filter). 0 clears a price. list_items shows the main
+// price, then any store prices in brackets: "Apples $1.39 (Trader Joe's $1.99)".
+{ "name": "shopping", "arguments": { "action": "set_item_price", "name": "Milk", "price": 3.49 } }
+{ "name": "shopping", "arguments": { "action": "set_item_price", "name": "Milk", "price": 2.99, "store_name": "Costco" } }
 ```
 
 ---

@@ -2,26 +2,25 @@ import { z } from "zod";
 import { textResponse, errorResponse } from "./helpers.js";
 import { createElicitationHelpers } from "./elicitation.js";
 
-// Default categories recognized by anylist.
-const valid_categories = ["baby","bakery","beverages","breakfast-and-cereal","condiments-oils-and-salad-dressings",
-  "cooking-and-baking","dairy","frozen-foods","grains-pasta-and-side-dishes",
-  "health-and-personal-care","household-and-cleaning","meat","pet-supplies",
-  "produce","seafood","snacks-cookies-and-candy","soups-and-canned-goods",
-  "wine-beer-spirits","other"];
-
   // TODO: What does this do?
 function buildDescription(stores) {
   const base = `Manage AnyList shopping lists and items. Actions:
 - list_lists: Show all lists with item counts
-- list_items: Show items on a list (grouped by category)
-- add_item: Add an item to a list
+- list_items: Show items on a list (grouped by category, with stores and prices); store_name shows only that store's items
+- add_item: Add an item to a list (optional category, store_name, price)
 - add_items: Add several items to a list in one call (use this instead of repeating add_item)
 - check_item: Check off (complete) an item
 - uncheck_item: Uncheck a previously checked-off item (make it active again)
 - delete_item: Permanently remove an item from a list
+- set_item_store: Assign an item to a store (omit store_name to clear it)
+- set_item_category: Move an item to another category
+- set_item_price: Set an item's price (0 clears it); with store_name, set that store's price instead of the main price
 - get_favorites: Get favorite items for a list
 - get_recents: Get recently added items for a list
-- list_stores: list stores available for the list (if any)`;
+- list_stores: list stores available for the list (if any)
+- create_store: Add a store to the list (name = store name)
+- list_categories: List the list's categories, built-in and custom
+- create_category: Add a custom category to the list (name = category name)`;
   if (!stores || stores.length === 0) return base;
   const storeList = stores.map(s => s.name).join(', ');
   return `${base}\n\nAvailable stores: ${storeList}`;
@@ -31,7 +30,7 @@ async function validateStoreName(client, storeName) {
   if (!storeName) return { valid: true, message: null };
   const stores = client.getStores();
   const storeNames = stores.map(s => s.name.toLowerCase());
-  if (!storeNames.includes(storeName.toLowerCase())) {
+  if (!storeNames.includes(storeName.trim().toLowerCase())) {
     return { valid: false, message: `Store "${storeName}" not found in list "${client.targetList.name}". Available stores: ${storeNames.join(", ")}.
     Create a new store from the web application or mobile app, then try again.` };
   }
@@ -69,6 +68,22 @@ export function register(server, getClient) {
     return await elicitItemChoice(itemName, matches);
   }
 
+  function validateCategory(client, category) {
+    if (!category || category === "other" || client.findCategory(category)) return null;
+    const available = client.getCategories().flatMap(g => g.categories).join(", ") || "none";
+    return `Category "${category}" not found in list "${client.targetList.name}". Available categories: ${available}`;
+  }
+
+  function validatePrice(price) {
+    if (price == null) return null;
+    const n = Number(price);
+    return Number.isFinite(n) && n >= 0 ? null : `Invalid price "${price}". Use a number such as 3.49 (0 clears the price).`;
+  }
+
+  function formatPrice(amount) {
+    return `$${Number(amount).toFixed(2)}`;
+  }
+
   let lastStoreSignature = '';
 
   const registeredTool = server.registerTool("shopping", {
@@ -76,31 +91,31 @@ export function register(server, getClient) {
     description: buildDescription([]),
     inputSchema: {
       action: z.enum(["list_lists", "list_items", "add_item", "add_items",
-        "set_item_store", "check_item", "uncheck_item", "delete_item", "get_favorites", "get_recents", "list_stores"]).describe("The shopping action to perform"),
+        "set_item_store", "set_item_category", "set_item_price", "check_item", "uncheck_item", "delete_item",
+        "get_favorites", "get_recents", "list_stores", "create_store", "list_categories", "create_category"]).describe("The shopping action to perform"),
       list_name: z.string().optional().describe("Name of the list (defaults to configured default list)"),
-      name: z.string().optional().describe("Item name (required for add_item, set_item_store, check_item, uncheck_item, delete_item)"),
+      name: z.string().optional().describe("Item name (required for add_item, set_item_store, set_item_category, set_item_price, check_item, uncheck_item, delete_item); the new store's name for create_store, or the new category's name for create_category"),
       items: z.array(z.union([
         z.string(),
         z.object({
           name: z.string(),
           quantity: z.union([z.number().min(1), z.string().min(1)]).optional(),
           notes: z.string().optional(),
-          category: z.enum(valid_categories).optional(),
+          category: z.string().optional(),
           store_name: z.string().optional(),
+          price: z.number().min(0).optional(),
         })
-      ])).optional().describe("Items to add (add_items only). Each entry is either a plain item name or an object with name/quantity/notes/category/store_name"),
+      ])).optional().describe("Items to add (add_items only). Each entry is either a plain item name or an object with name/quantity/notes/category/store_name/price"),
       quantity: z.union([z.number().min(1), z.string().min(1)]).optional().describe("Item quantity, e.g. 2 or \"500 g\" (add_item only, defaults to 1)"),
       notes: z.string().optional().describe("Notes for the item (add_item only)"),
       include_checked: z.boolean().optional().describe("Include checked-off items (list_items only, default false)"),
       include_notes: z.boolean().optional().describe("Include notes for each item (list_items only, default false)"),
-      category: z.enum(valid_categories).optional().describe("Category for the item (add_item only, defaults to 'other')"),
-      store_name: z.string().optional().describe("Store to assign to this item (add_item and set_item_store only; omit or leave blank to clear)"),
+      category: z.string().optional().describe("Category name as AnyList shows it, built-in or custom (see list_categories), or a built-in slug such as \"dairy\" (add_item, set_item_category). Applies to new items; use set_item_category for an item already on the list"),
+      store_name: z.string().optional().describe("Store name. add_item and set_item_store: the store to assign (omit on set_item_store to clear). list_items: show only items assigned to this store. set_item_price: set this store's price instead of the main price"),
+      price: z.number().min(0).optional().describe("Price per item, e.g. 3.49 (set_item_price, add_item; 0 clears it). Sets the item's main price, the one AnyList shows when the list isn't filtered to a store"),
     }
   }, async (params) => {
     const { action, list_name, name, quantity, notes, include_checked, include_notes, category } = params;
-    if (category && !valid_categories.includes(category)) {
-      throw new Error(`Invalid input for field "category": "${category}". Valid categories are: ${valid_categories.join(", ")}`);
-    }
     try {
       const client = await getClient();
       switch (action) {
@@ -133,7 +148,18 @@ export function register(server, getClient) {
             lastStoreSignature = sig;
             registeredTool.update({ description: buildDescription(stores) });
           }
-          const items = await client.getItems(include_checked || false, include_notes || false);
+          let items = await client.getItems(include_checked || false, include_notes || false);
+          let storeLabel = "";
+          if (params.store_name) {
+            const { valid, message } = await validateStoreName(client, params.store_name);
+            if (!valid) return errorResponse(message);
+            const target = params.store_name.trim().toLowerCase();
+            items = items.filter(i => (i.stores || []).some(s => s.trim().toLowerCase() === target));
+            storeLabel = ` at ${params.store_name.trim()}`;
+            if (items.length === 0) {
+              return textResponse(`No ${include_checked ? "" : "unchecked "}items assigned to ${params.store_name.trim()} on list "${client.targetList.name}".`);
+            }
+          }
           if (items.length === 0) {
             return textResponse(include_checked
               ? `List "${client.targetList.name}" is empty.`
@@ -151,12 +177,16 @@ export function register(server, getClient) {
               const qty = (qRaw && qRaw !== "1") ? ` (${qRaw})` : "";
               const status = item.checked ? " ✓" : "";
               const note = item.note ? ` [${item.note}]` : "";
-              const store = item.store ? ` @${item.store}` : "";
-              return `  - ${item.name}${qty}${status}${note}${store}`;
+              const store = (item.stores || []).map(s => ` @${s}`).join("");
+              const price = item.price != null ? ` ${formatPrice(item.price)}` : "";
+              const storePrices = (item.storePrices || []).length > 0
+                ? ` (${item.storePrices.map(p => `${p.store} ${formatPrice(p.amount)}`).join(", ")})`
+                : "";
+              return `  - ${item.name}${qty}${status}${price}${storePrices}${note}${store}`;
             }).join("\n");
             return `**${category}**\n${categoryItems}`;
           }).join("\n\n");
-          return textResponse(`Shopping list "${client.targetList.name}" (${items.length} items):\n${itemList}`);
+          return textResponse(`Shopping list "${client.targetList.name}"${storeLabel} (${items.length} items):\n${itemList}`);
         }
         case "add_item": {
           let itemName = name;
@@ -165,9 +195,12 @@ export function register(server, getClient) {
           
           const {valid, message} = await validateStoreName(client, params.store_name);
           if (!valid)
-            return errorResponse(message); 
+            return errorResponse(message);
+          const problem = validateCategory(client, category) || validatePrice(params.price);
+          if (problem) return errorResponse(problem);
 
-          await client.addItem(itemName, quantity || 1, notes || null, params.category || "other", params.store_name || null);
+          await client.addItem(itemName, quantity || 1, notes || null, category || "other", params.store_name || null);
+          if (params.price != null) await client.setItemPrice(itemName, params.price);
           return textResponse(`Successfully added "${itemName}" to list "${client.targetList.name}"`);
         }
         case "add_items": {
@@ -179,12 +212,12 @@ export function register(server, getClient) {
           for (const entry of entries) {
             const item = typeof entry === "string" ? { name: entry } : entry;
             try {
-              if (item.category && !valid_categories.includes(item.category)) {
-                throw new Error(`invalid category "${item.category}"`);
-              }
+              const problem = validateCategory(client, item.category) || validatePrice(item.price);
+              if (problem) throw new Error(problem);
               const { valid, message } = await validateStoreName(client, item.store_name);
               if (!valid) throw new Error(message);
               await client.addItem(item.name, item.quantity || 1, item.notes || null, item.category || "other", item.store_name || null);
+              if (item.price != null) await client.setItemPrice(item.name, item.price);
               added.push(item.name);
             } catch (error) {
               failed.push(`${item.name}: ${error.message}`);
@@ -218,6 +251,69 @@ export function register(server, getClient) {
           const resolvedDelete = await resolveItemName(client, itemName);
           await client.deleteItem(resolvedDelete);
           return textResponse(`Successfully deleted "${resolvedDelete}" from list "${client.targetList.name}"`);
+        }
+        case "set_item_store": {
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item should be assigned to a store?");
+          await client.connect(list_name);
+          const { valid, message } = await validateStoreName(client, params.store_name);
+          if (!valid) return errorResponse(message);
+          const resolved = await resolveItemName(client, itemName);
+          const storeName = params.store_name?.trim() || null;
+          await client.setItemStore(resolved, storeName);
+          return textResponse(storeName
+            ? `Assigned "${resolved}" to ${storeName} on list "${client.targetList.name}"`
+            : `Cleared the store for "${resolved}" on list "${client.targetList.name}"`);
+        }
+        case "set_item_category": {
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item should move to another category?");
+          let categoryName = category;
+          if (!categoryName) categoryName = await elicitRequiredField("category", "Which category should it go in?");
+          await client.connect(list_name);
+          const problem = validateCategory(client, categoryName);
+          if (problem) return errorResponse(problem);
+          const resolved = await resolveItemName(client, itemName);
+          const shownAs = await client.setItemCategory(resolved, categoryName);
+          return textResponse(`Moved "${resolved}" to ${shownAs} on list "${client.targetList.name}"`);
+        }
+        case "set_item_price": {
+          let itemName = name;
+          if (!itemName) itemName = await elicitRequiredField("name", "Which item's price should be set?");
+          if (params.price == null) throw new Error(`Action "set_item_price" requires "price" (0 clears it)`);
+          await client.connect(list_name);
+          const { valid, message } = await validateStoreName(client, params.store_name);
+          if (!valid) return errorResponse(message);
+          const resolved = await resolveItemName(client, itemName);
+          const storeName = params.store_name?.trim() || null;
+          await client.setItemPrice(resolved, params.price, storeName);
+          const where = storeName ? `${storeName} price` : "price";
+          return textResponse(params.price === 0
+            ? `Cleared the ${where} for "${resolved}" on list "${client.targetList.name}"`
+            : `Set the ${where} for "${resolved}" to ${formatPrice(params.price)} on list "${client.targetList.name}"`);
+        }
+        case "create_store": {
+          let storeName = name;
+          if (!storeName) storeName = await elicitRequiredField("name", "What should the new store be called?");
+          await client.connect(list_name);
+          const store = await client.createStore(storeName);
+          return textResponse(`Created store "${store.name}" on list "${client.targetList.name}"`);
+        }
+        case "list_categories": {
+          await client.connect(list_name || null);
+          const groups = client.getCategories().filter(g => g.categories.length > 0);
+          if (groups.length === 0) return textResponse(`No categories found for list "${client.targetList.name}".`);
+          const body = groups.length === 1
+            ? groups[0].categories.map(c => `- ${c}`).join("\n")
+            : groups.map(g => `**${g.group}**\n${g.categories.map(c => `  - ${c}`).join("\n")}`).join("\n\n");
+          return textResponse(`Categories for "${client.targetList.name}":\n${body}`);
+        }
+        case "create_category": {
+          let categoryName = name;
+          if (!categoryName) categoryName = await elicitRequiredField("name", "What should the new category be called?");
+          await client.connect(list_name);
+          const created = await client.createCategory(categoryName);
+          return textResponse(`Created category "${created.name}" on list "${client.targetList.name}"`);
         }
         case "get_favorites": {
           await client.connect(list_name || null);

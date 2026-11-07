@@ -1,5 +1,50 @@
+import { createHash } from 'node:crypto';
+import FormData from 'form-data';
 import AnyList from '../anylist-js/lib/index.js';
+import uuid from '../anylist-js/lib/uuid.js';
 import { normalizeRecipe } from './recipe-normalizer.js';
+
+// AnyList Web derives each item's category-assignment ID from the category
+// group ID with this UUIDv5 namespace, so an item has one assignment per group.
+const CATEGORY_ASSIGNMENT_NAMESPACE = '08e5c5bd-cd69-4454-a1ff-d611b6d9abc0';
+
+// Category match IDs AnyList treats as built-in; ListItem.category holds one of
+// these, or "other" for a custom category.
+const SYSTEM_CATEGORIES = new Set(["baby", "bakery", "beverages", "breakfast-and-cereal",
+  "condiments-oils-and-salad-dressings", "cooking-and-baking", "dairy", "frozen-foods",
+  "grains-pasta-and-side-dishes", "health-and-personal-care", "household-and-cleaning", "meat",
+  "pet-supplies", "produce", "seafood", "snacks-cookies-and-candy", "soups-and-canned-goods",
+  "wine-beer-spirits", "other"]);
+
+// ListItem fields anylist-js's Item doesn't carry. Copied from the loaded item
+// when an operation has to send the whole item, so the send doesn't drop them.
+const UNTRACKED_ITEM_FIELDS = ['recipeId', 'rawIngredient', 'priceMatchupTag', 'priceId', 'photoIds',
+  'eventId', 'priceQuantityPb', 'priceQuantityShouldOverrideItemQuantity', 'packageSizePb',
+  'pricePackageSizePb', 'pricePackageSizeShouldOverrideItemPackageSize', 'ingredients',
+  'itemQuantityShouldOverrideIngredientQuantity', 'itemPackageSizeShouldOverrideIngredientPackageSize',
+  'productUpc'];
+
+function uuid5Hex(name, namespace) {
+  const hash = createHash('sha1')
+    .update(Buffer.from(namespace.replace(/-/g, ''), 'hex'))
+    .update(name, 'utf8')
+    .digest();
+  hash[6] = (hash[6] & 0x0f) | 0x50;
+  hash[8] = (hash[8] & 0x3f) | 0x80;
+  return hash.subarray(0, 16).toString('hex');
+}
+
+// The match ID AnyList groups an item under: a built-in category's system
+// slug, or a slug of a custom category's name ("Bulk Bins" -> "bulk-bins").
+function categoryMatchId(category) {
+  if (category.systemCategory) return category.systemCategory;
+  return String(category.name || '').toLowerCase().trim()
+    .replace(/[‘’]/g, "'").replace(/[–—]/g, '-')
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/[\s-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
 
 class AnyListClient {
   /**
@@ -137,8 +182,8 @@ class AnyListClient {
         if (notes !== null) {
           itemOptions.details = notes;
         }
-        if (category !== "other") {
-          itemOptions.categoryMatchId = category;
+        if (category && category !== "other") {
+          Object.assign(itemOptions, this._categoryFields(category, []));
         }
         // Carry the quantity through creation so it lands in quantityPb.rawQuantity
         // (List.addItem encodes the item). Bare "1" is AnyList's default, so skip it.
@@ -275,14 +320,25 @@ class AnyListClient {
           name: item.name,
           quantity: item.quantity ?? null,
           checked: item.checked || false,
-          category: item.categoryMatchId || 'other'
+          category: this._categoryNameForItem(item)
         };
         if (includeNotes && item.details) {
           result.note = item.details;
         }
-        const store = (this.targetList.stores || []).find(s => s.identifier === item.storeIds[0]);
-        result.store = store ? store.name : null;
-        
+        const stores = this.targetList.stores || [];
+        result.stores = (item.storeIds || [])
+          .map(id => stores.find(s => s.identifier === id))
+          .filter(Boolean)
+          .map(s => s.name);
+        const prices = this._itemPrices(item).filter(p => p.amount != null);
+        const main = prices.find(p => !p.storeId);
+        result.price = main ? main.amount : null;
+        const storePrices = prices.filter(p => p.storeId).map(p => ({
+          store: stores.find(s => s.identifier === p.storeId)?.name || 'unknown store',
+          amount: p.amount,
+        }));
+        if (storePrices.length > 0) result.storePrices = storePrices;
+
         return result;
       });
     } catch (error) {
@@ -331,16 +387,23 @@ class AnyListClient {
     if (!item) {
       throw new Error(`Item "${itemName}" not found in list`);
     }
-    let storeIds = [];
-    if (storeName) {
-      const store = this.targetList.findStoreByName(storeName);
-      if (!store) {
-        const available = (this.targetList.stores || []).map(s => s.name).join(', ') || 'none';
-        throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
-      }
-      storeIds = [store.identifier];
-    }
+    const storeIds = storeName ? [this._requireStore(storeName).identifier] : [];
     await item.setStores(storeIds);
+  }
+
+  // Case-insensitive, like the tool's store validation.
+  _findStore(storeName) {
+    const target = String(storeName || '').trim().toLowerCase();
+    return (this.targetList.stores || []).find(s => s.name.trim().toLowerCase() === target) || null;
+  }
+
+  _requireStore(storeName) {
+    const store = this._findStore(storeName);
+    if (!store) {
+      const available = (this.targetList.stores || []).map(s => s.name).join(', ') || 'none';
+      throw new Error(`Store "${storeName}" not found. Available stores: ${available}`);
+    }
+    return store;
   }
 
   async createStore(storeName) {
@@ -348,7 +411,28 @@ class AnyListClient {
       throw new Error('Not connected to any list. Call connect() first.');
     }
     try {
-      const store = await this.targetList.createStore(storeName);
+      const cleanName = String(storeName || '').trim();
+      if (!cleanName) throw new Error('Store name is required.');
+      const stores = this.targetList.stores || (this.targetList.stores = []);
+      if (stores.some(s => s.name.toLowerCase() === cleanName.toLowerCase())) {
+        throw new Error('a store with that name already exists');
+      }
+      // anylist-js has no store creation, so send AnyList Web's new-store
+      // operation: a StoreOperation on the v2 endpoint, placed after the
+      // list's other stores.
+      const { protobuf, uid } = this.client;
+      const store = {
+        identifier: uuid(),
+        listId: this.targetList.identifier,
+        name: cleanName,
+        sortIndex: stores.reduce((max, s) => Math.max(max, s.sortIndex ?? -1), -1) + 1,
+      };
+      const op = new protobuf.PBListOperation();
+      op.setMetadata({ operationId: uuid(), handlerId: 'new-store', userId: uid, operationClass: 1 });
+      op.setListId(this.targetList.identifier);
+      op.setUpdatedStore(new protobuf.PBStore(store));
+      await this._postListOps([op], 'data/shopping-lists/update-v2');
+      stores.push(store);
       console.error(`Created store: ${store.name}`);
       return store;
     } catch (error) {
@@ -370,6 +454,233 @@ class AnyListClient {
     } catch (error) {
       throw new Error(`Failed to delete store "${storeName}": ${error.message}`);
     }
+  }
+
+  // ===== CATEGORIES =====
+  //
+  // Each list has one or more category groups (most have one), each holding
+  // the list's categories, built-in and custom. An item records the category
+  // it's in twice: a categoryAssignment per group (group ID + category ID) and
+  // a categoryMatchId (the category's slug), which the apps use to group it.
+
+  getCategories() {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    return (this.targetList.categoryGroups || []).map(group => ({
+      group: group.name,
+      categories: [...group.categories]
+        .sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0))
+        .map(c => c.name),
+    }));
+  }
+
+  /**
+   * Find a list category by its name ("Dairy", "Bulk Bins") or, for built-in
+   * categories, its slug ("dairy"). Returns { group, category } or null.
+   */
+  findCategory(nameOrSlug) {
+    if (!this.targetList || !nameOrSlug) return null;
+    const byName = this.targetList.findCategoryByName?.(nameOrSlug);
+    if (byName) return byName;
+    const target = String(nameOrSlug).trim().toLowerCase();
+    for (const group of this.targetList.categoryGroups || []) {
+      const category = group.categories.find(c => categoryMatchId(c) === target);
+      if (category) return { group, category };
+    }
+    return null;
+  }
+
+  _requireCategory(nameOrSlug) {
+    const found = this.findCategory(nameOrSlug);
+    if (!found) {
+      const available = this.getCategories().flatMap(g => g.categories).join(', ') || 'none';
+      throw new Error(`Category "${nameOrSlug}" not found in list "${this.targetList.name}". Available categories: ${available}`);
+    }
+    return found;
+  }
+
+  // The ListItem fields that put an item in a category: its assignment for
+  // the category's group (other groups' assignments are kept), match ID, and
+  // the legacy `category` field ("other" for a custom category).
+  _categoryFields(nameOrSlug, currentAssignments) {
+    const { group, category } = this._requireCategory(nameOrSlug);
+    const matchId = categoryMatchId(category);
+    return {
+      categoryAssignments: [
+        ...currentAssignments.filter(a => a.categoryGroupId !== group.identifier),
+        {
+          identifier: uuid5Hex(group.identifier, CATEGORY_ASSIGNMENT_NAMESPACE),
+          categoryGroupId: group.identifier,
+          categoryId: category.identifier,
+        },
+      ],
+      categoryMatchId: matchId,
+      category: SYSTEM_CATEGORIES.has(matchId) ? matchId : 'other',
+    };
+  }
+
+  // The name of the category an item shows under: from its assignment in the
+  // first group that has one, else from its match ID, else the match ID itself.
+  _categoryNameForItem(item) {
+    const groups = this.targetList.categoryGroups || [];
+    for (const group of groups) {
+      const assignment = (item.categoryAssignments || []).find(a => a.categoryGroupId === group.identifier);
+      const category = assignment && group.categories.find(c => c.identifier === assignment.categoryId);
+      if (category) return category.name;
+    }
+    const matchId = item.categoryMatchId || 'other';
+    for (const group of groups) {
+      const category = group.categories.find(c => categoryMatchId(c) === matchId);
+      if (category) return category.name;
+    }
+    return matchId;
+  }
+
+  /**
+   * Move an existing item to another category, the way AnyList Web does: an
+   * update-list-item-category-assignment operation with the whole item and
+   * its new assignment, then set-list-item-category-match-id with the whole
+   * item and the new match ID in originalValue.
+   */
+  async setItemCategory(itemName, nameOrSlug) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
+    }
+    const fields = this._categoryFields(nameOrSlug, item.categoryAssignments || []);
+    const { protobuf, uid } = this.client;
+
+    item._categoryAssignments = fields.categoryAssignments;
+    const assignmentOp = new protobuf.PBListOperation();
+    assignmentOp.setMetadata({ operationId: uuid(), handlerId: 'update-list-item-category-assignment', userId: uid });
+    assignmentOp.setListId(this.targetList.identifier);
+    assignmentOp.setListItemId(item.identifier);
+    assignmentOp.setListItem(this._encodeFullItem(item));
+
+    item._categoryMatchId = fields.categoryMatchId;
+    item._category = fields.category;
+    const matchOp = new protobuf.PBListOperation();
+    matchOp.setMetadata({ operationId: uuid(), handlerId: 'set-list-item-category-match-id', userId: uid });
+    matchOp.setListId(this.targetList.identifier);
+    matchOp.setListItemId(item.identifier);
+    matchOp.setListItem(this._encodeFullItem(item));
+    matchOp.setOriginalValue(fields.categoryMatchId);
+
+    await this._postListOps([assignmentOp, matchOp]);
+    item._fieldsToUpdate = (item._fieldsToUpdate || []).filter(f => f !== 'categoryMatchId');
+    return this._categoryNameForItem(item);
+  }
+
+  async createCategory(name) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    if (this.targetList.findCategoryByName(name)) {
+      throw new Error(`Category "${String(name).trim()}" already exists in list "${this.targetList.name}"`);
+    }
+    const group = this.targetList.categoryGroups?.[0];
+    const sortIndex = group ? group.categories.reduce((max, c) => Math.max(max, c.sortIndex ?? -1), -1) + 1 : 0;
+    return this.targetList.createCategory({ name, sortIndex });
+  }
+
+  // ===== PRICES =====
+  //
+  // AnyList keeps prices per store on each item: ListItem.prices holds one
+  // PBItemPrice per storeId. The entry with no storeId is the item's main
+  // price, the one the apps show when the list isn't filtered to a store; a
+  // store's entry shows only under that store's filter. anylist-js's Item
+  // doesn't carry prices, so they're read from the raw user-data snapshot and
+  // kept in step locally after each write. Adapted from Josephtd8421's
+  // anylist-mcp fork (https://github.com/Josephtd8421/anylist-mcp/pull/2).
+
+  // The loaded (raw protobuf) copy of an item, or null if it was added after
+  // the snapshot was taken.
+  _rawItem(item) {
+    const rawList = (this.client?._userData?.shoppingListsResponse?.newLists || [])
+      .find(l => l.identifier === this.targetList.identifier);
+    return (rawList?.items || []).find(i => i.identifier === item.identifier) || null;
+  }
+
+  _itemPrices(item) {
+    const rawItem = this._rawItem(item);
+    if (rawItem) return rawItem.prices || (rawItem.prices = []);
+    this._newItemPrices ??= new Map();
+    if (!this._newItemPrices.has(item.identifier)) this._newItemPrices.set(item.identifier, []);
+    return this._newItemPrices.get(item.identifier);
+  }
+
+  /**
+   * Set (or clear, with null or 0) an item's main price, or with `storeName`,
+   * that store's price.
+   */
+  async setItemPrice(itemName, amount, storeName = null) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
+    }
+    if (amount != null && !(Number.isFinite(Number(amount)) && Number(amount) >= 0)) {
+      throw new Error(`Invalid price "${amount}"`);
+    }
+    const storeId = storeName ? this._requireStore(storeName).identifier : '';
+    const prices = this._itemPrices(item);
+
+    // save-item-price replaces the store's whole price entry, so carry over its
+    // details and date. An entry with no amount is how AnyList removes a price.
+    const index = prices.findIndex(p => (p.storeId || '') === storeId);
+    const clearing = amount == null || Number(amount) === 0;
+    const itemPrice = { storeId: storeId || null };
+    if (!clearing) {
+      itemPrice.amount = Number(amount);
+      if (index >= 0 && prices[index].details) itemPrice.details = prices[index].details;
+      if (index >= 0 && prices[index].date) itemPrice.date = prices[index].date;
+    }
+
+    const { protobuf, uid } = this.client;
+    const op = new protobuf.PBListOperation();
+    op.setMetadata({ operationId: uuid(), handlerId: 'save-item-price', userId: uid });
+    op.setListId(this.targetList.identifier);
+    op.setListItemId(item.identifier);
+    op.setItemPrice(new protobuf.PBItemPrice(itemPrice));
+    await this._postListOps([op]);
+
+    if (clearing) {
+      if (index >= 0) prices.splice(index, 1);
+    } else if (index >= 0) {
+      prices[index] = itemPrice;
+    } else {
+      prices.push(itemPrice);
+    }
+  }
+
+  // ===== LIST OPERATION HELPERS =====
+
+  // The whole item, for operations that carry it: the fields anylist-js
+  // tracks, plus the ones it doesn't from the loaded copy, plus prices.
+  _encodeFullItem(item) {
+    const encoded = item._encode();
+    const raw = this._rawItem(item);
+    if (raw) {
+      for (const field of UNTRACKED_ITEM_FIELDS) {
+        if (raw[field] != null) encoded[field] = raw[field];
+      }
+    }
+    encoded.prices = this._itemPrices(item).map(p => new this.client.protobuf.PBItemPrice(p));
+    return encoded;
+  }
+
+  async _postListOps(ops, path = 'data/shopping-lists/update') {
+    const opList = new this.client.protobuf.PBListOperationList();
+    opList.setOperations(ops);
+    const form = new FormData();
+    form.append('operations', opList.toBuffer());
+    await this.client.client.post(path, { body: form });
   }
 
   // ===== RECIPES =====

@@ -45,12 +45,11 @@ describe('shopping tool', () => {
     });
 
     it('should return error for invalid category', async () => {
-      try {
-        await handlers.shopping({ action: 'add_item', name: 'Soda', category: 'invalid-category' });
-        assert.fail('Expected error for invalid category');
-      } catch (e) {
-        assert.ok(e.message.includes('Invalid input for field "category"'));
-      }
+      const result = await handlers.shopping({ action: 'add_item', name: 'Soda', category: 'invalid-category' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('Category "invalid-category" not found'));
+      assert.ok(result.content[0].text.includes('Available categories: Produce, Dairy'));
+      assert.equal(client._items.length, 0);
     });
   });
 
@@ -105,7 +104,7 @@ describe('shopping tool', () => {
         items: [{ name: 'Soda', category: 'invalid-category' }, 'Milk'],
       });
       assert.equal(result.isError, true);
-      assert.ok(result.content[0].text.includes('invalid category "invalid-category"'));
+      assert.ok(result.content[0].text.includes('Category "invalid-category" not found'));
       assert.deepEqual(client._items.map(i => i.name), ['Milk']);
     });
 
@@ -284,6 +283,141 @@ describe('shopping tool', () => {
       client._recents = [{ name: 'Avocado' }];
       const result = await handlers.shopping({ action: 'get_recents' });
       assert.ok(result.content[0].text.includes('Avocado'));
+    });
+  });
+  describe('stores', () => {
+    beforeEach(() => { client._stores = [{ name: 'Costco' }, { name: 'Safeway' }]; });
+
+    it('set_item_store assigns a store', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_store', name: 'Milk', store_name: 'Costco' });
+      assert.ok(result.content[0].text.includes('Assigned "Milk" to Costco'));
+      assert.equal(client._items[0].store, 'Costco');
+    });
+
+    it('set_item_store clears the store when store_name is omitted', async () => {
+      client._items.push({ name: 'Milk', store: 'Costco' });
+      const result = await handlers.shopping({ action: 'set_item_store', name: 'Milk' });
+      assert.ok(result.content[0].text.includes('Cleared the store'));
+      assert.equal(client._items[0].store, null);
+    });
+
+    it('set_item_store rejects an unknown store', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_store', name: 'Milk', store_name: 'Nowhere' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('Store "Nowhere" not found'));
+    });
+
+    it('list_items with store_name shows only that store\'s items', async () => {
+      client._items.push({ name: 'Milk', store: 'Costco' }, { name: 'Bread', store: 'Safeway' }, { name: 'Eggs' });
+      const text = (await handlers.shopping({ action: 'list_items', store_name: 'costco' })).content[0].text;
+      assert.ok(text.includes('at costco (1 items)'));
+      assert.ok(text.includes('Milk'));
+      assert.ok(!text.includes('Bread'));
+      assert.ok(!text.includes('Eggs'));
+    });
+
+    it('list_items shows each item\'s store', async () => {
+      client._items.push({ name: 'Milk', store: 'Costco' });
+      const text = (await handlers.shopping({ action: 'list_items' })).content[0].text;
+      assert.ok(text.includes('Milk @Costco'));
+    });
+
+    it('create_store adds a store', async () => {
+      const result = await handlers.shopping({ action: 'create_store', name: 'Trader Joes' });
+      assert.ok(result.content[0].text.includes('Created store "Trader Joes"'));
+      assert.ok(client._stores.some(s => s.name === 'Trader Joes'));
+    });
+
+    it('create_store reports a duplicate', async () => {
+      const result = await handlers.shopping({ action: 'create_store', name: 'costco' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('already exists'));
+    });
+  });
+
+  describe('categories', () => {
+    it('add_item accepts a category by its display name', async () => {
+      await handlers.shopping({ action: 'add_item', name: 'Milk', category: 'Dairy' });
+      assert.equal(client._items[0].category, 'Dairy');
+    });
+
+    it('set_item_category moves an item', async () => {
+      client._items.push({ name: 'Milk', category: 'other' });
+      const result = await handlers.shopping({ action: 'set_item_category', name: 'Milk', category: 'dairy' });
+      assert.ok(result.content[0].text.includes('Moved "Milk" to Dairy'));
+      assert.equal(client._items[0].category, 'dairy');
+    });
+
+    it('set_item_category rejects an unknown category and lists the real ones', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_category', name: 'Milk', category: 'Nope' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('Available categories: Produce, Dairy, Meat, Bakery, Other'));
+    });
+
+    it('set_item_category resolves a partial item name', async () => {
+      client._items.push({ name: 'Whole Milk' });
+      await handlers.shopping({ action: 'set_item_category', name: 'milk', category: 'Dairy' });
+      assert.equal(client._items[0].category, 'dairy');
+    });
+
+    it('list_categories lists the list\'s categories', async () => {
+      const text = (await handlers.shopping({ action: 'list_categories' })).content[0].text;
+      assert.ok(text.includes('- Produce'));
+      assert.ok(text.includes('- Other'));
+    });
+
+    it('create_category adds a custom category usable right away', async () => {
+      const result = await handlers.shopping({ action: 'create_category', name: 'Bulk Bins' });
+      assert.ok(result.content[0].text.includes('Created category "Bulk Bins"'));
+      await handlers.shopping({ action: 'add_item', name: 'Oats', category: 'Bulk Bins' });
+      assert.equal(client._items[0].category, 'Bulk Bins');
+    });
+  });
+
+  describe('prices', () => {
+    it('set_item_price sets the main price', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_price', name: 'Milk', price: 3.49 });
+      assert.ok(result.content[0].text.includes('Set the price for "Milk" to $3.49'));
+      assert.equal(client._items[0].price, 3.49);
+    });
+
+    it('set_item_price with store_name sets that store\'s price', async () => {
+      client._stores = [{ name: 'Costco' }];
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_price', name: 'Milk', price: 2.99, store_name: 'Costco' });
+      assert.ok(result.content[0].text.includes('Set the Costco price'));
+      assert.deepEqual(client._items[0].storePrices, [{ store: 'Costco', amount: 2.99 }]);
+      assert.equal(client._items[0].price, undefined);
+    });
+
+    it('set_item_price with 0 clears the price', async () => {
+      client._items.push({ name: 'Milk', price: 3.49 });
+      const result = await handlers.shopping({ action: 'set_item_price', name: 'Milk', price: 0 });
+      assert.ok(result.content[0].text.includes('Cleared the price'));
+      assert.equal(client._items[0].price, null);
+    });
+
+    it('set_item_price requires a price', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_price', name: 'Milk' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('requires "price"'));
+    });
+
+    it('add_item and add_items accept a price', async () => {
+      await handlers.shopping({ action: 'add_item', name: 'Milk', price: 3.49 });
+      await handlers.shopping({ action: 'add_items', items: [{ name: 'Eggs', price: 4 }, 'Bread'] });
+      assert.deepEqual(client._items.map(i => i.price ?? null), [3.49, 4, null]);
+    });
+
+    it('list_items shows the main price and store prices', async () => {
+      client._items.push({ name: 'Apples', price: 1.39, storePrices: [{ store: 'Trader Joes', amount: 1.99 }] });
+      const text = (await handlers.shopping({ action: 'list_items' })).content[0].text;
+      assert.ok(text.includes('Apples $1.39 (Trader Joes $1.99)'));
     });
   });
 });
