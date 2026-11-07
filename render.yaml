@@ -1,0 +1,39 @@
+# Render Blueprint for the AnyList MCP HTTP server.
+# Deploy: Render Dashboard > New > Blueprint > pick this repo and the deploy/render branch.
+#
+# Needs a paid instance: Free web services can't attach a persistent disk, and the
+# SQLite database on /data holds user accounts, encrypted AnyList credentials, and
+# OAuth tokens. Without the disk, every restart signs Claude out.
+services:
+  - type: web
+    name: anylist-mcp
+    runtime: docker
+    plan: starter
+    branch: deploy/render
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: anylist-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /data
+      # Upload allowed-emails.txt as a Secret File in the Render dashboard.
+      - key: ALLOWED_EMAILS_FILE
+        value: /etc/secrets/allowed-emails.txt
+      # 64-character hex string. Generate locally with:
+      #   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+      # Keep a copy: losing it means stored AnyList passwords can't be decrypted.
+      - key: SERVER_SECRET_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      # Set to the service's public URL, e.g. https://anylist-mcp-xxxx.onrender.com
+      - key: BASE_URL
+        sync: false
+      - key: ANYLIST_SESSION_IDLE_MINUTES
+        value: "30"
