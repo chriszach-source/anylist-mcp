@@ -39,6 +39,7 @@ export class MockAnyListClient {
     this._collections = [];
     this._pendingImport = null;
     this._stores = [];
+    this._categories = defaultCategories();
   }
 
   reset() {
@@ -55,6 +56,7 @@ export class MockAnyListClient {
     this._collections = [];
     this._pendingImport = null;
     this._stores = [];
+    this._categories = defaultCategories();
   }
 
   async connect(listName = null) {
@@ -96,16 +98,18 @@ export class MockAnyListClient {
     this._items.splice(idx, 1);
   }
 
-  async getItems(includeChecked = false, includeNotes = false, includeStore = false) {
+  async getItems(includeChecked = false, includeNotes = false) {
     let items = [...this._items];
     if (!includeChecked) items = items.filter(i => !i.checked);
     return items.map(i => ({
       name: i.name,
       quantity: i.quantity || 1,
       checked: i.checked || false,
-      category: i.category || 'other',
+      category: this.findCategory(i.category)?.category.name || i.category || 'other',
       ...(includeNotes && i.notes ? { note: i.notes } : {}),
-      ...(includeStore && i.store ? { store: i.store } : {}),
+      stores: i.store ? [i.store] : [],
+      price: i.price ?? null,
+      ...(i.storePrices ? { storePrices: i.storePrices } : {}),
     }));
   }
 
@@ -113,6 +117,50 @@ export class MockAnyListClient {
     const item = this._items.find(i => i.name === name);
     if (!item) throw new Error(`Item "${name}" not found in list`);
     item.store = store || null;
+  }
+
+  getCategories() {
+    return [{ group: 'Default', categories: this._categories.map(c => c.name) }];
+  }
+
+  findCategory(nameOrSlug) {
+    if (!nameOrSlug) return null;
+    const t = String(nameOrSlug).trim().toLowerCase();
+    const category = this._categories.find(c => c.name.toLowerCase() === t || c.slug === t);
+    return category ? { group: { name: 'Default' }, category } : null;
+  }
+
+  async setItemCategory(name, category) {
+    const item = this._items.find(i => i.name === name);
+    if (!item) throw new Error(`Item "${name}" not found in list`);
+    item.category = this.findCategory(category).category.slug;
+    return this.findCategory(category).category.name;
+  }
+
+  async setItemPrice(name, amount, store = null) {
+    const item = this._items.find(i => i.name === name);
+    if (!item) throw new Error(`Item "${name}" not found in list`);
+    if (store) {
+      item.storePrices = [...(item.storePrices || []).filter(p => p.store !== store), ...(amount ? [{ store, amount }] : [])];
+    } else {
+      item.price = amount ? amount : null;
+    }
+  }
+
+  async createStore(name) {
+    if (this._stores.some(s => s.name.toLowerCase() === name.toLowerCase())) {
+      throw new Error(`Failed to create store "${name}": a store with that name already exists`);
+    }
+    const store = { identifier: `store-${this._stores.length + 1}`, name };
+    this._stores.push(store);
+    return store;
+  }
+
+  async createCategory(name) {
+    if (this.findCategory(name)) throw new Error(`Category "${name}" already exists in list "${this.targetList.name}"`);
+    const category = { name, slug: name.toLowerCase().replace(/\s+/g, '-') };
+    this._categories.push(category);
+    return category;
   }
 
   async getFavoriteItems() { return this._favorites; }
@@ -214,4 +262,10 @@ export class MockAnyListClient {
     if (idx === -1) throw new Error(`Recipe collection "${name}" not found`);
     this._collections.splice(idx, 1);
   }
+}
+
+function defaultCategories() {
+  return [
+    ['Produce', 'produce'], ['Dairy', 'dairy'], ['Meat', 'meat'], ['Bakery', 'bakery'], ['Other', 'other'],
+  ].map(([name, slug]) => ({ name, slug }));
 }
