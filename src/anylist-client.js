@@ -32,6 +32,13 @@ const UNTRACKED_ITEM_FIELDS = ['recipeId', 'rawIngredient', 'priceMatchupTag', '
   'itemQuantityShouldOverrideIngredientQuantity', 'itemPackageSizeShouldOverrideIngredientPackageSize',
   'productUpc'];
 
+// anylist-js's Ingredient keeps the heading flag in _isHeading with no getter,
+// so `ingredient.isHeading` is always undefined. This is why reading a recipe
+// back showed its headings as plain ingredients.
+function ingredientIsHeading(ingredient) {
+  return Boolean(ingredient.isHeading ?? ingredient._isHeading);
+}
+
 function uuid5Hex(name, namespace) {
   const hash = createHash('sha1')
     .update(Buffer.from(namespace.replace(/-/g, ''), 'hex'))
@@ -957,6 +964,15 @@ class AnyListClient {
     }
   }
 
+  // Full details of every recipe, from one fetch (for the style audit).
+  async getAllRecipeDetails() {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    const recipes = await this.client.getRecipes();
+    return recipes.map(r => this._recipeDetails(r));
+  }
+
   async getRecipeDetails(recipeName) {
     if (!this.client) {
       throw new Error('Not connected. Call connect() first.');
@@ -967,34 +983,38 @@ class AnyListClient {
       if (!recipe) {
         throw new Error(`Recipe "${recipeName}" not found`);
       }
-      return {
-        identifier: recipe.identifier,
-        name: recipe.name,
-        note: recipe.note || null,
-        sourceName: recipe.sourceName || null,
-        sourceUrl: recipe.sourceUrl || null,
-        rating: recipe.rating || null,
-        prepTime: recipe.prepTime || null,
-        cookTime: recipe.cookTime || null,
-        servings: recipe.servings || null,
-        nutritionalInfo: recipe.nutritionalInfo || null,
-        createdAt: recipe.creationTimestamp
-          ? new Date(recipe.creationTimestamp * 1000).toISOString()
-          : (recipe.timestamp ? new Date(recipe.timestamp * 1000).toISOString() : null),
-        ingredients: recipe.ingredients ? recipe.ingredients.map(i => ({
-          rawIngredient: i.rawIngredient || null,
-          name: i.name || null,
-          quantity: i.quantity || null,
-          note: i.note || null,
-          isHeading: Boolean(i.isHeading),
-        })) : [],
-        photoUrls: recipe.photoUrls || [],
-        photoIds: recipe.photoIds || [],
-        preparationSteps: recipe.preparationSteps || [],
-      };
+      return this._recipeDetails(recipe);
     } catch (error) {
       throw new Error(`Failed to get recipe details: ${error.message}`);
     }
+  }
+
+  _recipeDetails(recipe) {
+    return {
+      identifier: recipe.identifier,
+      name: recipe.name,
+      note: recipe.note || null,
+      sourceName: recipe.sourceName || null,
+      sourceUrl: recipe.sourceUrl || null,
+      rating: recipe.rating || null,
+      prepTime: recipe.prepTime || null,
+      cookTime: recipe.cookTime || null,
+      servings: recipe.servings || null,
+      nutritionalInfo: recipe.nutritionalInfo || null,
+      createdAt: recipe.creationTimestamp
+        ? new Date(recipe.creationTimestamp * 1000).toISOString()
+        : (recipe.timestamp ? new Date(recipe.timestamp * 1000).toISOString() : null),
+      ingredients: recipe.ingredients ? recipe.ingredients.map(i => ({
+        rawIngredient: i.rawIngredient || null,
+        name: i.name || null,
+        quantity: i.quantity || null,
+        note: i.note || null,
+        isHeading: ingredientIsHeading(i),
+      })) : [],
+      photoUrls: recipe.photoUrls || [],
+      photoIds: recipe.photoIds || [],
+      preparationSteps: recipe.preparationSteps || [],
+    };
   }
 
   async importRecipeFromUrl(url) {
@@ -1191,6 +1211,107 @@ class AnyListClient {
     } catch (error) {
       throw new Error(`Failed to update recipe: ${error.message}`);
     }
+  }
+
+  /**
+   * Every ingredient line across recipes, for reviewing or cleaning them up in
+   * bulk. `search` keeps lines whose quantity, name, or note contains it;
+   * `recipeName` keeps one recipe; `since` (YYYY-MM-DD) keeps recipes created
+   * on or after that date. Line numbers count from 1 and include headings.
+   * Idea from djbrinkerhoff/anylist-mcp's list_ingredients.
+   */
+  async listIngredients({ search = null, recipeName = null, since = null } = {}) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    let recipes = await this.client.getRecipes();
+    if (recipeName) {
+      recipes = recipes.filter(r => r.name && r.name.toLowerCase() === recipeName.toLowerCase());
+      if (recipes.length === 0) throw new Error(`Recipe "${recipeName}" not found`);
+    }
+    if (since) {
+      const cutoff = Date.parse(since.length === 10 ? `${since}T00:00:00` : since) / 1000;
+      if (Number.isNaN(cutoff)) throw new Error(`Invalid date "${since}". Use YYYY-MM-DD.`);
+      // Recipes with no creation time are left out: their other timestamp moves on every edit.
+      recipes = recipes.filter(r => r.creationTimestamp && r.creationTimestamp >= cutoff);
+    }
+    const needle = search ? search.toLowerCase() : null;
+    const rows = [];
+    for (const recipe of recipes) {
+      recipe.ingredients.forEach((ing, index) => {
+        const row = {
+          recipe: recipe.name,
+          line: index + 1,
+          isHeading: ingredientIsHeading(ing),
+          quantity: ing.quantity || '',
+          name: ing.name || ing.rawIngredient || '',
+          note: ing.note || '',
+        };
+        if (needle && ![row.quantity, row.name, row.note].some(v => v.toLowerCase().includes(needle))) return;
+        rows.push(row);
+      });
+    }
+    return rows;
+  }
+
+  /**
+   * Edit ingredient lines in place across recipes. Each edit names a recipe,
+   * a line number, and the line's current name (a guard, so a list that
+   * changed since it was read isn't edited blindly), plus the fields to set:
+   * quantity, name, note, isHeading. Only those fields change; each line keeps
+   * its identifier and position, so items on a shopping list stay linked to
+   * it. One save per recipe. Edits that don't match are reported, not guessed.
+   */
+  async editIngredients(edits = []) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    const recipes = await this.client.getRecipes();
+    const results = [];
+    const byRecipe = new Map();
+    for (const [order, original] of edits.entries()) {
+      const edit = { ...original, order };
+      const matches = recipes.filter(r => r.name && r.name.toLowerCase() === String(edit.recipe || '').toLowerCase());
+      if (matches.length !== 1) {
+        results.push({ ...edit, outcome: matches.length === 0 ? 'recipe not found' : `${matches.length} recipes have this name` });
+        continue;
+      }
+      if (!byRecipe.has(matches[0])) byRecipe.set(matches[0], []);
+      byRecipe.get(matches[0]).push(edit);
+    }
+    for (const [recipe, recipeEdits] of byRecipe) {
+      let changed = false;
+      for (const edit of recipeEdits) {
+        const ing = recipe.ingredients[edit.line - 1];
+        const current = ing ? (ing.name || ing.rawIngredient || '') : null;
+        if (!ing) {
+          results.push({ ...edit, outcome: `no line ${edit.line} (the recipe has ${recipe.ingredients.length})` });
+          continue;
+        }
+        if (edit.currentName != null && current.trim().toLowerCase() !== String(edit.currentName).trim().toLowerCase()) {
+          results.push({ ...edit, outcome: `line ${edit.line} is now "${current}", not "${edit.currentName}"; skipped` });
+          continue;
+        }
+        if (edit.quantity !== undefined) ing._quantity = edit.quantity || null;
+        if (edit.name !== undefined) {
+          if (!String(edit.name).trim()) {
+            results.push({ ...edit, outcome: 'a line needs a name; skipped' });
+            continue;
+          }
+          ing._name = String(edit.name).trim();
+        }
+        if (edit.note !== undefined) ing._note = edit.note || null;
+        if (edit.isHeading !== undefined) ing._isHeading = Boolean(edit.isHeading);
+        // Kept in step with the fields, as the recipes tool builds it.
+        ing._rawIngredient = ing._isHeading
+          ? ing._name
+          : `${ing._quantity || ''} ${ing._name || ''}${ing._note ? `, ${ing._note}` : ''}`.trim();
+        changed = true;
+        results.push({ ...edit, outcome: 'updated' });
+      }
+      if (changed) await recipe.save();
+    }
+    return results.sort((a, b) => a.order - b.order).map(({ order, ...rest }) => rest);
   }
 
   async deleteRecipe(recipeName) {

@@ -85,7 +85,24 @@ Manage shopping lists and items.
 // price, then any store prices in brackets: "Apples $1.39 (Trader Joe's $1.99)".
 { "name": "shopping", "arguments": { "action": "set_item_price", "name": "Milk", "price": 3.49 } }
 { "name": "shopping", "arguments": { "action": "set_item_price", "name": "Milk", "price": 2.99, "store_name": "Costco" } }
+
+// Change an item already on the list: rename it, set its quantity, or set or
+// clear (with "") its notes. Only what you pass changes. A rename keeps the
+// item's remembered categories under the new name.
+{ "name": "shopping", "arguments": { "action": "update_item", "name": "Milk", "new_name": "Whole milk", "quantity": "2 gallons", "notes": "" } }
+
+// A store's own category set (its aisles, say). In AnyList a store gets one
+// through its store filter; set that up in the app first. With store_name,
+// list_categories, set_item_category, and create_category work in that set,
+// and list_items groups that store's items by it.
+{ "name": "shopping", "arguments": { "action": "list_categories", "store_name": "Costco" } }
+{ "name": "shopping", "arguments": { "action": "create_category", "name": "Aisle 12", "store_name": "Costco" } }
+{ "name": "shopping", "arguments": { "action": "set_item_category", "name": "Milk", "category": "Aisle 12", "store_name": "Costco" } }
 ```
+
+After set_item_category, AnyList is told to remember the item's category (its
+categorization rule), so the item lands there the next time anyone adds it,
+unless the list's "remember item categories" setting is off.
 
 ---
 
@@ -112,6 +129,8 @@ Manage AnyList recipes, including URL import and text parsing.
 | `url` | string | For import/normalize | URL to fetch recipe from |
 | `text` | string | For normalize | Raw recipe text to parse |
 | `save` | boolean | No | Save normalized result to AnyList (normalize only) |
+| `since` | string | No | `YYYY-MM-DD`: only recipes created on or after it (list_ingredients) |
+| `edits` | array | For edit_ingredients | `[{ recipe, line, current_name, quantity?, name?, note?, heading? }]` |
 
 **Actions:**
 
@@ -155,7 +174,44 @@ Manage AnyList recipes, including URL import and text parsing.
 // Parse and preview a recipe without saving (set save=true to also save)
 { "name": "recipes", "arguments": { "action": "normalize", "url": "https://..." } }
 { "name": "recipes", "arguments": { "action": "normalize", "text": "Pasta\n\n1 lb spaghetti\n\n1. Boil pasta", "save": true } }
+
+// Every ingredient line across recipes: recipe | line | quantity | name | note.
+// Filter by text (search), one recipe (name), or creation date (since).
+{ "name": "recipes", "arguments": { "action": "list_ingredients", "search": "salt" } }
+
+// Edit lines in place across recipes. current_name is the line's name now, from
+// list_ingredients; an edit whose line no longer has that name is skipped and
+// reported. Lines keep their position and identity, so shopping-list items stay
+// linked to them. One save per recipe.
+{ "name": "recipes", "arguments": { "action": "edit_ingredients", "edits": [
+    { "recipe": "Salsa", "line": 3, "current_name": "1 tsp kosher salt", "quantity": "6 g", "name": "kosher salt", "note": "about 1 tsp" }
+] } }
+
+// Check recipes against the style guide (all, or one by name). Reports only.
+{ "name": "recipes", "arguments": { "action": "audit" } }
 ```
+
+### Style guide
+
+Set `STYLE_GUIDE_FILE` to a Markdown file describing how recipes and items are
+written in your AnyList (on Render, upload it as a Secret File and point the
+variable at `/etc/secrets/<name>`). The server then sends it as its MCP
+instructions, adds a `style_guide` tool that returns it, and enables
+`recipes` → `audit`. The file is re-read on each use. A ```` ```json ```` block
+in it sets the audit's mechanical rules, all optional:
+
+| Rule | Checks |
+|------|--------|
+| `titleLowercaseWords` | Title case, keeping these words lowercase unless first |
+| `spellings` | `{ "wrong": "right" }`, matched as whole words |
+| `prepInNote` | `true`: text after a comma in a name ("Onion, diced") belongs in the note |
+| `requireGrams` | `true`: each ingredient needs a gram weight in its quantity or note |
+| `noQuantityOk` | Names allowed without a quantity or gram weight, e.g. `["salt", "pepper"]` |
+| `requireNutrition` | `true`: each recipe needs nutrition facts |
+
+Always checked: stray spaces, quantities typed into the name, headings with a
+quantity, duplicate lines, empty or hand-numbered steps. See
+`style-guide.example.md`.
 
 ---
 

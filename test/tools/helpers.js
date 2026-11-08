@@ -212,6 +212,30 @@ export class MockAnyListClient {
     return { identifier: r.identifier, name: r.name };
   }
 
+  async getAllRecipeDetails() {
+    return this._recipes.map(r => ({ preparationSteps: [], ingredients: [], ...r }));
+  }
+
+  async listIngredients({ search = null, recipeName = null } = {}) {
+    return this._recipes
+      .filter(r => !recipeName || r.name.toLowerCase() === recipeName.toLowerCase())
+      .flatMap(r => (r.ingredients || []).map((i, idx) => ({
+        recipe: r.name, line: idx + 1, isHeading: Boolean(i.isHeading),
+        quantity: i.quantity || '', name: i.name || '', note: i.note || '',
+      })))
+      .filter(row => !search || `${row.quantity} ${row.name} ${row.note}`.toLowerCase().includes(search.toLowerCase()));
+  }
+
+  async editIngredients(edits) {
+    return edits.map(e => {
+      const r = this._recipes.find(x => x.name.toLowerCase() === e.recipe.toLowerCase());
+      const ing = r?.ingredients?.[e.line - 1];
+      if (!ing) return { ...e, outcome: 'recipe not found' };
+      for (const k of ['quantity', 'name', 'note', 'isHeading']) if (e[k] !== undefined) ing[k] = e[k];
+      return { ...e, outcome: 'updated' };
+    });
+  }
+
   async deleteRecipe(name) {
     const idx = this._recipes.findIndex(r => r.name.toLowerCase() === name.toLowerCase());
     if (idx === -1) throw new Error(`Recipe "${name}" not found`);

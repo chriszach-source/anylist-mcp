@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import dotenv from "dotenv";
 import AnyListClient from "./anylist-client.js";
 import { registerAllTools } from "./tools/index.js";
+import { styleGuideInstructions } from "./style-guide.js";
 
 dotenv.config();
 
@@ -15,7 +16,7 @@ const anylistClient = new AnyListClient();
 const server = new McpServer({
   name: "anylist-mcp-server",
   version: "1.9.0",
-});
+}, { instructions: styleGuideInstructions() });
 
 registerAllTools(server, () => anylistClient);
 

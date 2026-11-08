@@ -1,7 +1,11 @@
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { register } from '../../src/tools/recipes.js';
 import { MockAnyListClient, createMockServer } from './helpers.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { register as registerStyleGuide } from '../../src/tools/style-guide.js';
 
 describe('recipes tool', () => {
   let client;
@@ -330,6 +334,77 @@ describe('recipes tool', () => {
     it('returns error for non-existent recipe', async () => {
       const result = await handlers.recipes({ action: 'delete', name: 'Nope' });
       assert.equal(result.isError, true);
+    });
+  });
+
+  describe('ingredient lines', () => {
+    beforeEach(() => {
+      client._recipes.push({ name: 'Salsa', ingredients: [{ name: 'Tomatoes', quantity: '500 g', note: 'diced' }, { name: 'Sauce', isHeading: true }] });
+    });
+
+    it('list_ingredients shows recipe, line, quantity, name, and note', async () => {
+      const text = (await handlers.recipes({ action: 'list_ingredients', search: 'tomato' })).content[0].text;
+      assert.ok(text.startsWith('1 line(s) in 1 recipe(s).'));
+      assert.ok(text.includes('Salsa | 1 | 500 g | Tomatoes | diced'));
+    });
+
+    it('list_ingredients marks headings', async () => {
+      const text = (await handlers.recipes({ action: 'list_ingredients', name: 'Salsa' })).content[0].text;
+      assert.ok(text.includes('Salsa | 2 | heading | Sauce'));
+    });
+
+    it('edit_ingredients reports each edit', async () => {
+      const result = await handlers.recipes({ action: 'edit_ingredients', edits: [
+        { recipe: 'Salsa', line: 1, current_name: 'Tomatoes', note: 'seeded and diced' },
+      ] });
+      assert.ok(result.content[0].text.includes('Updated 1 of 1 line(s)'));
+      assert.equal(client._recipes[0].ingredients[0].note, 'seeded and diced');
+    });
+
+    it('edit_ingredients is an error when any edit didn\'t apply', async () => {
+      const result = await handlers.recipes({ action: 'edit_ingredients', edits: [
+        { recipe: 'Nachos', line: 1, current_name: 'Chips', note: 'x' },
+      ] });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('Nachos, line 1 ("Chips"): recipe not found'));
+    });
+  });
+
+  describe('style guide', () => {
+    const saved = process.env.STYLE_GUIDE_FILE;
+    let file;
+    beforeEach(() => {
+      file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sg-')), 'guide.md');
+      fs.writeFileSync(file, '# Our recipes\n\n```json\n{ "requireGrams": true }\n```\n');
+      process.env.STYLE_GUIDE_FILE = file;
+    });
+    afterEach(() => {
+      if (saved === undefined) delete process.env.STYLE_GUIDE_FILE;
+      else process.env.STYLE_GUIDE_FILE = saved;
+    });
+
+    it('audit lists what to fix, per recipe', async () => {
+      client._recipes.push(
+        { name: 'Salsa', ingredients: [{ name: 'Tomatoes', quantity: '2 cups' }] },
+        { name: 'Toast', ingredients: [{ name: 'Bread', quantity: '60 g' }] },
+      );
+      const text = (await handlers.recipes({ action: 'audit' })).content[0].text;
+      assert.ok(text.startsWith('1 of 2 recipe(s) need attention'));
+      assert.ok(text.includes('## Salsa\n- Ingredient 1 "Tomatoes": no gram weight'));
+      assert.ok(!text.includes('## Toast'));
+    });
+
+    it('audit without a guide says how to set one up', async () => {
+      delete process.env.STYLE_GUIDE_FILE;
+      const result = await handlers.recipes({ action: 'audit' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('STYLE_GUIDE_FILE'));
+    });
+
+    it('the style_guide tool returns the guide', async () => {
+      const { server, handlers: h } = createMockServer();
+      registerStyleGuide(server);
+      assert.ok((await h.style_guide({})).content[0].text.startsWith('# Our recipes'));
     });
   });
 });

@@ -2,6 +2,8 @@ import { z } from "zod";
 import { textResponse, errorResponse } from "./helpers.js";
 import { createElicitationHelpers } from "./elicitation.js";
 import { normalizeRecipe } from "../recipe-normalizer.js";
+import { loadStyleGuide, STYLE_GUIDE_HINT } from "../style-guide.js";
+import { auditRecipe } from "../style-audit.js";
 
 const toMinutes = (seconds) => Math.round(seconds / 60);
 const toSeconds = (minutes) => Math.round(minutes * 60);
@@ -30,12 +32,26 @@ export function register(server, getClient) {
 - update: Partially update an existing recipe by name (only the fields you pass change; the rest are preserved). Pass new_name to rename it.
 - delete: Delete a recipe by name
 - import_url: Import a recipe from a website URL (parses ingredients, steps, etc.)
-- normalize: Preview/parse a recipe from a URL or raw text without saving (set save=true to also save)`,
+- normalize: Preview/parse a recipe from a URL or raw text without saving (set save=true to also save)
+- list_ingredients: Every ingredient line across recipes (recipe, line number, quantity, name, note), for review or bulk cleanup. Filter with search (text in quantity, name, or note), name (one recipe), or since (YYYY-MM-DD, recipes created on or after)
+- edit_ingredients: Edit ingredient lines in place across recipes. Each edit gives recipe, line, current_name (the line's name now, from list_ingredients), and the fields to change (quantity, name, note, heading). Lines keep their position and identity, so shopping-list links survive
+- audit: Check recipes against the style guide (all, or one with name) and list what to fix; changes nothing${loadStyleGuide() ? STYLE_GUIDE_HINT : ""}`,
     inputSchema: {
-      action: z.enum(["list", "get", "create", "update", "delete", "import_url", "normalize"]).describe("The recipe action to perform"),
-      name: z.string().optional().describe("Recipe name (required for get, create, update, delete)"),
+      action: z.enum(["list", "get", "create", "update", "delete", "import_url", "normalize",
+        "list_ingredients", "edit_ingredients", "audit"]).describe("The recipe action to perform"),
+      name: z.string().optional().describe("Recipe name (required for get, create, update, delete; optional filter for list_ingredients and audit)"),
       new_name: z.string().optional().describe("New name for the recipe (update only)"),
-      search: z.string().optional().describe("Search query to filter recipes (list only)"),
+      search: z.string().optional().describe("Search query to filter recipes (list), or ingredient lines (list_ingredients)"),
+      since: z.string().optional().describe("YYYY-MM-DD: only recipes created on or after this date (list_ingredients)"),
+      edits: z.array(z.object({
+        recipe: z.string().describe("Recipe name"),
+        line: z.number().int().min(1).describe("Line number from list_ingredients (headings count)"),
+        current_name: z.string().describe("The line's name now, from list_ingredients; the edit is skipped if it no longer matches"),
+        quantity: z.string().optional().describe("New quantity; empty string clears it"),
+        name: z.string().optional().describe("New name"),
+        note: z.string().optional().describe("New note; empty string clears it"),
+        heading: z.boolean().optional().describe("Make the line a heading (true) or an ingredient (false)"),
+      })).optional().describe("Ingredient line edits (edit_ingredients)"),
       ingredients: z.array(z.object({
         name: z.string().describe("Ingredient name, e.g. 'flour'. For a heading, the heading text, e.g. 'Sauce'"),
         quantity: z.string().optional().describe("Quantity with unit, e.g. '2 cups'. Omit for headings"),
@@ -56,7 +72,7 @@ export function register(server, getClient) {
       save: z.boolean().optional().describe("If true, also save normalized recipe to AnyList (normalize only, default false)"),
     }
   }, async (params) => {
-    const { action, name, new_name, search, ingredients, steps, note, source_name, source_url, prep_time, cook_time, servings, photo_url, nutrition, url, text: recipeText, save: saveRecipe } = params;
+    const { action, name, new_name, search, since, edits, ingredients, steps, note, source_name, source_url, prep_time, cook_time, servings, photo_url, nutrition, url, text: recipeText, save: saveRecipe } = params;
     try {
       const client = await getClient();
       await client.connect(null);
@@ -162,6 +178,45 @@ export function register(server, getClient) {
           const updated = await client.updateRecipe(updateRecipeName, fields);
           if (fields.name !== undefined) return textResponse(`Renamed recipe "${updateRecipeName}" to "${updated.name}"`);
           return textResponse(`Updated recipe "${updated.name}"`);
+        }
+        case "list_ingredients": {
+          const rows = await client.listIngredients({ search, recipeName: name, since });
+          if (rows.length === 0) return textResponse("No ingredient lines match.");
+          const recipes = new Set(rows.map(r => r.recipe));
+          const lines = rows.map(r => r.isHeading
+            ? `${r.recipe} | ${r.line} | heading | ${r.name}`
+            : `${r.recipe} | ${r.line} | ${r.quantity} | ${r.name} | ${r.note}`);
+          return textResponse(`${rows.length} line(s) in ${recipes.size} recipe(s). Columns: recipe | line | quantity | name | note\n${lines.join("\n")}`);
+        }
+        case "edit_ingredients": {
+          if (!edits || edits.length === 0) throw new Error(`Action "edit_ingredients" requires edits`);
+          const results = await client.editIngredients(edits.map(e => ({
+            recipe: e.recipe, line: e.line, currentName: e.current_name,
+            quantity: e.quantity, name: e.name, note: e.note, isHeading: e.heading,
+          })));
+          const updated = results.filter(r => r.outcome === "updated").length;
+          const lines = results.map(r => `- ${r.recipe}, line ${r.line} ("${r.currentName}"): ${r.outcome}`);
+          const text = `Updated ${updated} of ${results.length} line(s):\n${lines.join("\n")}`;
+          return updated === results.length ? textResponse(text) : errorResponse(text);
+        }
+        case "audit": {
+          const guide = loadStyleGuide();
+          if (!guide) return errorResponse("No style guide is configured on this server (set STYLE_GUIDE_FILE).");
+          let recipes = await client.getAllRecipeDetails();
+          if (name) {
+            recipes = recipes.filter(r => r.name && r.name.toLowerCase() === name.toLowerCase());
+            if (recipes.length === 0) return errorResponse(`Recipe "${name}" not found`);
+          }
+          const flagged = recipes
+            .map(r => ({ name: r.name, issues: auditRecipe(r, guide.rules) }))
+            .filter(r => r.issues.length > 0);
+          if (flagged.length === 0) return textResponse(`All ${recipes.length} recipe(s) pass the style guide checks.`);
+          let report = `${flagged.length} of ${recipes.length} recipe(s) need attention:\n`;
+          for (const r of flagged) {
+            report += `\n## ${r.name}\n${r.issues.map(i => `- ${i}`).join("\n")}\n`;
+          }
+          report += "\nThese checks are mechanical; also apply the rest of the style guide.";
+          return textResponse(report);
         }
         case "delete": {
           let deleteRecipeName = name;
