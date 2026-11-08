@@ -119,22 +119,40 @@ export class MockAnyListClient {
     item.store = store || null;
   }
 
-  getCategories() {
-    return [{ group: 'Default', categories: this._categories.map(c => c.name) }];
+  _setFor(store) {
+    if (!store) return this._categories;
+    const key = Object.keys(this._storeCategories || {}).find(k => k.toLowerCase() === store.trim().toLowerCase());
+    if (!key) throw new Error(`${store} doesn't have its own category set on list "${this.targetList.name}".`);
+    return this._storeCategories[key];
   }
 
-  findCategory(nameOrSlug) {
+  getCategories(store = null) {
+    return [{ group: store ? `${store} aisles` : 'Default', stores: store ? [store] : [], categories: this._setFor(store).map(c => c.name) }];
+  }
+
+  findCategory(nameOrSlug, store = null) {
     if (!nameOrSlug) return null;
     const t = String(nameOrSlug).trim().toLowerCase();
-    const category = this._categories.find(c => c.name.toLowerCase() === t || c.slug === t);
+    const category = this._setFor(store).find(c => c.name.toLowerCase() === t || c.slug === t);
     return category ? { group: { name: 'Default' }, category } : null;
   }
 
-  async setItemCategory(name, category) {
+  async setItemCategory(name, category, store = null) {
     const item = this._items.find(i => i.name === name);
     if (!item) throw new Error(`Item "${name}" not found in list`);
-    item.category = this.findCategory(category).category.slug;
-    return this.findCategory(category).category.name;
+    const found = this.findCategory(category, store).category;
+    if (store) item.storeCategory = found.name;
+    else item.category = found.slug;
+    return found.name;
+  }
+
+  async updateItem(name, { newName, quantity, notes } = {}) {
+    const item = this._items.find(i => i.name === name);
+    if (!item) throw new Error(`Item "${name}" not found in list`);
+    if (newName != null) item.name = newName.trim();
+    if (quantity != null) item.quantity = quantity;
+    if (notes != null) item.notes = notes;
+    return { name: item.name, quantity: item.quantity, notes: item.notes || '' };
   }
 
   async setItemPrice(name, amount, store = null) {
@@ -156,10 +174,10 @@ export class MockAnyListClient {
     return store;
   }
 
-  async createCategory(name) {
-    if (this.findCategory(name)) throw new Error(`Category "${name}" already exists in list "${this.targetList.name}"`);
+  async createCategory(name, store = null) {
+    if (this.findCategory(name, store)) throw new Error(`Category "${name}" already exists in list "${this.targetList.name}"`);
     const category = { name, slug: name.toLowerCase().replace(/\s+/g, '-') };
-    this._categories.push(category);
+    this._setFor(store).push(category);
     return category;
   }
 

@@ -11,6 +11,10 @@ const uuid = requireFromAnyList('./uuid');
 // AnyList Web derives each item's category-assignment ID from the category
 // group ID with this UUIDv5 namespace, so an item has one assignment per group.
 const CATEGORY_ASSIGNMENT_NAMESPACE = '08e5c5bd-cd69-4454-a1ff-d611b6d9abc0';
+// AnyList Web's namespaces for categorization-rule IDs (item name + group +
+// list) and for a list's default category set (list ID). From aioanylist.
+const CATEGORY_GROUP_NAMESPACE = 'f656a81f-0e0a-419a-a451-21f4f2eac51b';
+const CATEGORIZATION_RULE_NAMESPACE = 'f4338133-428d-4f0b-9402-7c9b23243f14';
 
 // Category match IDs AnyList treats as built-in; ListItem.category holds one of
 // these, or "other" for a custom category.
@@ -58,10 +62,41 @@ class AnyListClient {
    */
   constructor({ username, password, defaultListName } = {}) {
     this.client = null;
-    this.targetList = null;
+    this._targetListId = null;
+    this._lastTargetList = null;
+    this._listsFetchedAt = 0;
     this._username = username || null;
     this._password = password || null;
     this.defaultListName = defaultListName || null;
+  }
+
+  /**
+   * The connected list, looked up by identifier on every access. anylist-js
+   * replaces `client.lists` with new objects on each refresh, so a cached
+   * List object goes stale. Falls back to the last object seen if the list
+   * isn't in `client.lists`. From linuxmaier/anylist-mcp#27.
+   */
+  get targetList() {
+    if (!this._targetListId) return null;
+    const current = this.client?.lists?.find(l => l.identifier === this._targetListId);
+    if (current) this._lastTargetList = current;
+    return this._lastTargetList;
+  }
+
+  set targetList(list) {
+    this._targetListId = list?.identifier ?? null;
+    this._lastTargetList = list ?? null;
+  }
+
+  // Re-read the lists, so changes made in the apps are seen. The library's
+  // websocket push is meant to do this, but rnilssoncx measured it not
+  // reaching a long-lived client (an item changed half an hour earlier still
+  // showed the old store), so don't rely on it. Calls a few seconds apart
+  // share one read.
+  async _refreshLists() {
+    if (Date.now() - this._listsFetchedAt < 5000) return;
+    await this.client.getLists();
+    this._listsFetchedAt = Date.now();
   }
 
   async connect(listName = null) {
@@ -81,14 +116,15 @@ class AnyListClient {
       throw error;
     }
 
-    // If already connected to the same list, skip reconnection
-    if (this.client && this.targetList && this.targetList.name === targetListName) {
-      return true;
-    }
-
     try {
-      // Create AnyList client if not already authenticated
-      if (!this.client) {
+      if (this.client) {
+        await this._refreshLists();
+        // Already connected to the same list: nothing else to do
+        if (this.targetList && this.targetList.name === targetListName) {
+          return true;
+        }
+      } else {
+        // Create the AnyList client and authenticate
         this.client = new AnyList({
           email: username,
           password: password
@@ -100,6 +136,7 @@ class AnyListClient {
         console.error('Successfully authenticated with AnyList');
 
         await this.client.getLists();
+        this._listsFetchedAt = Date.now();
       }
 
       // Find the target list
@@ -161,24 +198,24 @@ class AnyListClient {
         if (existingItem.checked) {
           // Uncheck the item to make it active again
           existingItem.checked = false;
-          existingItem.quantity = quantity; // Update quantity if needed
           if (notes !== null) {
             existingItem.details = notes;
           }
 
           console.error(`Unchecked existing item: ${existingItem.name}`);
-          existingItem.save();
+          await this._saveItem(existingItem);
+          await this._setQuantityIfChanged(existingItem, quantity);
         } else {
 
           // Item already exists and is unchecked, no action needed
           console.error(`Item "${itemName}" already exists and is active`);
-          existingItem.quantity = quantity;
           if (notes !== null) {
             existingItem.details = notes;
           }
           // Category not used if item already has a category
 
-          existingItem.save();
+          if (existingItem._fieldsToUpdate?.length) await this._saveItem(existingItem);
+          await this._setQuantityIfChanged(existingItem, quantity);
         }
       } else {
         // Item doesn't exist, create new one
@@ -302,7 +339,7 @@ class AnyListClient {
     }
   }
 
-  async getItems(includeChecked = false, includeNotes = false) {
+  async getItems(includeChecked = false, includeNotes = false, storeName = null) {
     if (!this.targetList) {
       const error = new Error('Not connected to any list. Call connect() first.');
       console.error(error.message);
@@ -324,7 +361,7 @@ class AnyListClient {
           name: item.name,
           quantity: item.quantity ?? null,
           checked: item.checked || false,
-          category: this._categoryNameForItem(item)
+          category: this._categoryNameForItem(item, storeName && this._findStore(storeName) ? storeName : null)
         };
         if (includeNotes && item.details) {
           result.note = item.details;
@@ -467,67 +504,141 @@ class AnyListClient {
   // it's in twice: a categoryAssignment per group (group ID + category ID) and
   // a categoryMatchId (the category's slug), which the apps use to group it.
 
-  getCategories() {
-    if (!this.targetList) {
-      throw new Error('Not connected to any list. Call connect() first.');
-    }
-    return (this.targetList.categoryGroups || []).map(group => ({
-      group: group.name,
-      categories: [...group.categories]
-        .sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0))
-        .map(c => c.name),
-    }));
+  // The list's main category set: the one its settings select, else the one
+  // AnyList derives from the list ID, else the first.
+  _mainCategoryGroup() {
+    const groups = this.targetList.categoryGroups || [];
+    const settings = (this.client?._userData?.listSettingsResponse?.settings || [])
+      .find(s => s.listId === this.targetList.identifier);
+    const derivedId = uuid5Hex(this.targetList.identifier, CATEGORY_GROUP_NAMESPACE);
+    return groups.find(g => g.identifier === settings?.listCategoryGroupId)
+      || groups.find(g => g.identifier === derivedId)
+      || groups[0]
+      || null;
+  }
+
+  // The list's store filters. anylist-js doesn't load them, so read them from
+  // the loaded user data.
+  _storeFilters() {
+    const response = (this.client?._userData?.shoppingListsResponse?.listResponses || [])
+      .find(r => r.listId === this.targetList.identifier);
+    return response?.storeFilters || [];
   }
 
   /**
-   * Find a list category by its name ("Dairy", "Bulk Bins") or, for built-in
-   * categories, its slug ("dairy"). Returns { group, category } or null.
+   * A store's own category set (for example, Costco's aisles), or null if the
+   * store doesn't have one. In AnyList a store's set is chosen on the store
+   * filter for that store, so it's found through the filter.
    */
-  findCategory(nameOrSlug) {
-    if (!this.targetList || !nameOrSlug) return null;
-    const byName = this.targetList.findCategoryByName?.(nameOrSlug);
-    if (byName) return byName;
-    const target = String(nameOrSlug).trim().toLowerCase();
-    for (const group of this.targetList.categoryGroups || []) {
-      const category = group.categories.find(c => categoryMatchId(c) === target);
-      if (category) return { group, category };
+  _storeCategoryGroup(storeName) {
+    const store = this._requireStore(storeName);
+    const groups = this.targetList.categoryGroups || [];
+    const main = this._mainCategoryGroup();
+    for (const filter of this._storeFilters()) {
+      if (!(filter.storeIds || []).includes(store.identifier) || !filter.listCategoryGroupId) continue;
+      const group = groups.find(g => g.identifier === filter.listCategoryGroupId);
+      if (group && group !== main) return group;
     }
     return null;
   }
 
-  _requireCategory(nameOrSlug) {
-    const found = this.findCategory(nameOrSlug);
+  // The category set to use: the store's own set when a store is named,
+  // else the list's main set.
+  _categoryGroupFor(storeName = null) {
+    if (!storeName) return this._mainCategoryGroup();
+    const group = this._storeCategoryGroup(storeName);
+    if (!group) {
+      throw new Error(`${this._requireStore(storeName).name} doesn't have its own category set on list "${this.targetList.name}". `
+        + 'In the AnyList app, give its store filter a category set first, or leave out store_name to use the list\'s main categories.');
+    }
+    return group;
+  }
+
+  // Each category set, in AnyList order, with the stores whose filter uses it.
+  getCategories(storeName = null) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const sorted = group => [...group.categories]
+      .sort((a, b) => (a.sortIndex ?? 0) - (b.sortIndex ?? 0))
+      .map(c => c.name);
+    if (storeName) {
+      const group = this._categoryGroupFor(storeName);
+      return [{ group: group.name, stores: [this._requireStore(storeName).name], categories: sorted(group) }];
+    }
+    const stores = this.targetList.stores || [];
+    const filters = this._storeFilters();
+    const main = this._mainCategoryGroup();
+    const groups = this.targetList.categoryGroups || [];
+    return [main, ...groups.filter(g => g !== main)].filter(Boolean).map(group => ({
+      group: group.name,
+      stores: group === main ? [] : stores
+        .filter(st => filters.some(f => f.listCategoryGroupId === group.identifier && (f.storeIds || []).includes(st.identifier)))
+        .map(st => st.name),
+      categories: sorted(group),
+    }));
+  }
+
+  /**
+   * Find a category by its name ("Dairy", "Aisle 12") or, for built-in
+   * categories, its slug ("dairy"): in the store's own set when a store is
+   * named, else in the list's main set. Returns { group, category } or null.
+   */
+  findCategory(nameOrSlug, storeName = null) {
+    if (!this.targetList || !nameOrSlug) return null;
+    const group = this._categoryGroupFor(storeName);
+    if (!group) return null;
+    const target = String(nameOrSlug).trim().toLowerCase();
+    const category = group.categories.find(c => c.name.trim().toLowerCase() === target)
+      || group.categories.find(c => categoryMatchId(c) === target);
+    return category ? { group, category } : null;
+  }
+
+  _requireCategory(nameOrSlug, storeName = null) {
+    const found = this.findCategory(nameOrSlug, storeName);
     if (!found) {
-      const available = this.getCategories().flatMap(g => g.categories).join(', ') || 'none';
-      throw new Error(`Category "${nameOrSlug}" not found in list "${this.targetList.name}". Available categories: ${available}`);
+      const available = this.getCategories(storeName)[0]?.categories.join(', ') || 'none';
+      const where = storeName ? `${this._requireStore(storeName).name}'s categories` : `list "${this.targetList.name}"`;
+      throw new Error(`Category "${nameOrSlug}" not found in ${where}. Available categories: ${available}`);
     }
     return found;
   }
 
-  // The ListItem fields that put an item in a category: its assignment for
-  // the category's group (other groups' assignments are kept), match ID, and
-  // the legacy `category` field ("other" for a custom category).
+  // The item's assignments with the one for `group` set to `category`;
+  // assignments in other sets are kept. Assignment IDs are derived from the
+  // set's ID the way AnyList Web derives them.
+  _withAssignment(currentAssignments, group, category) {
+    return [
+      ...currentAssignments.filter(a => a.categoryGroupId !== group.identifier),
+      {
+        identifier: uuid5Hex(group.identifier, CATEGORY_ASSIGNMENT_NAMESPACE),
+        categoryGroupId: group.identifier,
+        categoryId: category.identifier,
+      },
+    ];
+  }
+
+  // The ListItem fields that put a new item in a main-set category: its
+  // assignment, match ID, and the legacy `category` field ("other" for a
+  // custom category).
   _categoryFields(nameOrSlug, currentAssignments) {
     const { group, category } = this._requireCategory(nameOrSlug);
     const matchId = categoryMatchId(category);
     return {
-      categoryAssignments: [
-        ...currentAssignments.filter(a => a.categoryGroupId !== group.identifier),
-        {
-          identifier: uuid5Hex(group.identifier, CATEGORY_ASSIGNMENT_NAMESPACE),
-          categoryGroupId: group.identifier,
-          categoryId: category.identifier,
-        },
-      ],
+      categoryAssignments: this._withAssignment(currentAssignments, group, category),
       categoryMatchId: matchId,
       category: SYSTEM_CATEGORIES.has(matchId) ? matchId : 'other',
     };
   }
 
   // The name of the category an item shows under: from its assignment in the
-  // first group that has one, else from its match ID, else the match ID itself.
-  _categoryNameForItem(item) {
-    const groups = this.targetList.categoryGroups || [];
+  // store's own set when a store is named, else the main set, then the other
+  // sets; else from its match ID; else the match ID itself.
+  _categoryNameForItem(item, storeName = null) {
+    const main = this._mainCategoryGroup();
+    const preferred = storeName ? this._storeCategoryGroup(storeName) : null;
+    const groups = [preferred, main, ...(this.targetList.categoryGroups || [])]
+      .filter((g, i, all) => g && all.indexOf(g) === i);
     for (const group of groups) {
       const assignment = (item.categoryAssignments || []).find(a => a.categoryGroupId === group.identifier);
       const category = assignment && group.categories.find(c => c.identifier === assignment.categoryId);
@@ -544,10 +655,13 @@ class AnyListClient {
   /**
    * Move an existing item to another category, the way AnyList Web does: an
    * update-list-item-category-assignment operation with the whole item and
-   * its new assignment, then set-list-item-category-match-id with the whole
-   * item and the new match ID in originalValue.
+   * its new assignment, then, for the main set, set-list-item-category-match-id
+   * with the whole item and the new match ID in originalValue. A store's own
+   * set has no match ID, so a move there sends only the assignment
+   * (rnilssoncx/anylist-mcp's live-tested sequence). Then the categorization
+   * rule, so the category sticks the next time the item is added.
    */
-  async setItemCategory(itemName, nameOrSlug) {
+  async setItemCategory(itemName, nameOrSlug, storeName = null) {
     if (!this.targetList) {
       throw new Error('Not connected to any list. Call connect() first.');
     }
@@ -555,40 +669,165 @@ class AnyListClient {
     if (!item) {
       throw new Error(`Item "${itemName}" not found in list`);
     }
-    const fields = this._categoryFields(nameOrSlug, item.categoryAssignments || []);
+    const { group, category } = this._requireCategory(nameOrSlug, storeName);
     const { protobuf, uid } = this.client;
 
-    item._categoryAssignments = fields.categoryAssignments;
+    item._categoryAssignments = this._withAssignment(item.categoryAssignments || [], group, category);
     const assignmentOp = new protobuf.PBListOperation();
     assignmentOp.setMetadata({ operationId: uuid(), handlerId: 'update-list-item-category-assignment', userId: uid });
     assignmentOp.setListId(this.targetList.identifier);
     assignmentOp.setListItemId(item.identifier);
     assignmentOp.setListItem(this._encodeFullItem(item));
+    const ops = [assignmentOp];
 
-    item._categoryMatchId = fields.categoryMatchId;
-    item._category = fields.category;
-    const matchOp = new protobuf.PBListOperation();
-    matchOp.setMetadata({ operationId: uuid(), handlerId: 'set-list-item-category-match-id', userId: uid });
-    matchOp.setListId(this.targetList.identifier);
-    matchOp.setListItemId(item.identifier);
-    matchOp.setListItem(this._encodeFullItem(item));
-    matchOp.setOriginalValue(fields.categoryMatchId);
+    if (group === this._mainCategoryGroup()) {
+      const matchId = categoryMatchId(category);
+      item._categoryMatchId = matchId;
+      item._category = SYSTEM_CATEGORIES.has(matchId) ? matchId : 'other';
+      const matchOp = new protobuf.PBListOperation();
+      matchOp.setMetadata({ operationId: uuid(), handlerId: 'set-list-item-category-match-id', userId: uid });
+      matchOp.setListId(this.targetList.identifier);
+      matchOp.setListItemId(item.identifier);
+      matchOp.setListItem(this._encodeFullItem(item));
+      matchOp.setOriginalValue(matchId);
+      ops.push(matchOp);
+    }
 
-    await this._postListOps([assignmentOp, matchOp]);
+    await this._postListOps(ops);
     item._fieldsToUpdate = (item._fieldsToUpdate || []).filter(f => f !== 'categoryMatchId');
-    return this._categoryNameForItem(item);
+    await this._saveCategorizationRules(item.name, [{ groupId: group.identifier, categoryId: category.identifier }]);
+    return this._categoryNameForItem(item, storeName);
   }
 
-  async createCategory(name) {
+  // Whether the list remembers item categories (the app's "Remember Item
+  // Categories" setting). On unless the list's settings turn it off.
+  _remembersCategories() {
+    const settings = this.client?._userData?.listSettingsResponse?.settings || [];
+    const forList = settings.find(s => s.listId === this.targetList.identifier);
+    return forList?.shouldRememberItemCategories !== false;
+  }
+
+  /**
+   * Save AnyList's categorization rule for an item name in each given category
+   * group, as the apps do after a category change, so the item lands in the
+   * same category the next time anyone adds it. Rule IDs are derived the way
+   * AnyList Web derives them, so a later save replaces rather than duplicates.
+   * Format from BookCatKid/aioanylist; rnilssoncx/anylist-mcp writes the same
+   * rule after every move.
+   */
+  async _saveCategorizationRules(itemName, assignments) {
+    if (!this._remembersCategories() || assignments.length === 0) return;
+    const { protobuf, uid } = this.client;
+    const listId = this.targetList.identifier;
+    const ops = assignments.map(({ groupId, categoryId }) => {
+      const op = new protobuf.PBListOperation();
+      op.setMetadata({ operationId: uuid(), handlerId: 'save-categorization-rule', userId: uid, operationClass: 5 });
+      op.setListId(listId);
+      op.setUpdatedCategorizationRule(new protobuf.PBListCategorizationRule({
+        identifier: uuid5Hex(String(itemName).toLowerCase() + groupId + listId, CATEGORIZATION_RULE_NAMESPACE),
+        listId,
+        categoryGroupId: groupId,
+        itemName: String(itemName).toLowerCase(),
+        categoryId,
+      }));
+      return op;
+    });
+    await this._postListOps(ops, 'data/shopping-lists/update-v2');
+  }
+
+  // ===== ITEM EDITS =====
+
+  // anylist-js's save() sends every field changed since the item was loaded
+  // and never clears that record, so a second save would resend old changes.
+  async _saveItem(item) {
+    await item.save();
+    item._fieldsToUpdate = [];
+  }
+
+  /**
+   * Set an existing item's quantity with set-list-item-quantity-v2, the
+   * operation AnyList Web sends. The library's set-list-item-quantity writes
+   * only a legacy field the apps don't show (found and checked live by
+   * rnilssoncx/anylist-mcp, 2026-10-26). Sends a partial item, so nothing else
+   * is overwritten.
+   */
+  async _setQuantity(item, quantity) {
+    const raw = String(quantity ?? '').trim();
+    if (!raw) throw new Error('Quantity is required.');
+    const parts = raw.match(/^(\d+(?:[.,/]\d+)?)\s*(.*)$/);
+    const quantityPb = { rawQuantity: raw };
+    if (parts) {
+      quantityPb.amount = parts[1];
+      if (parts[2]) quantityPb.unit = parts[2];
+    }
+    const { protobuf, uid } = this.client;
+    const op = new protobuf.PBListOperation();
+    op.setMetadata({ operationId: uuid(), handlerId: 'set-list-item-quantity-v2', userId: uid });
+    op.setListId(this.targetList.identifier);
+    op.setListItemId(item.identifier);
+    op.setListItem(new protobuf.ListItem({
+      identifier: item.identifier,
+      listId: this.targetList.identifier,
+      quantityPb,
+      deprecatedQuantity: raw,
+    }));
+    await this._postListOps([op]);
+    item._quantity = raw;
+  }
+
+  async _setQuantityIfChanged(item, quantity) {
+    if (quantity == null) return;
+    if (String(item.quantity ?? '').trim() === String(quantity).trim()) return;
+    // A new item's default of 1 shouldn't overwrite a quantity the item has.
+    if (Number(quantity) === 1 && item.quantity) return;
+    await this._setQuantity(item, quantity);
+  }
+
+  /**
+   * Change an item already on the list: its name, quantity, or notes. Only the
+   * fields given change. A rename keeps the item's categories remembered under
+   * the new name. A name another item has (checked off or not) is refused.
+   */
+  async updateItem(itemName, { newName, quantity, notes } = {}) {
     if (!this.targetList) {
       throw new Error('Not connected to any list. Call connect() first.');
     }
-    if (this.targetList.findCategoryByName(name)) {
-      throw new Error(`Category "${String(name).trim()}" already exists in list "${this.targetList.name}"`);
+    const item = this.targetList.getItemByName(itemName);
+    if (!item) {
+      throw new Error(`Item "${itemName}" not found in list`);
     }
-    const group = this.targetList.categoryGroups?.[0];
+    const cleanName = newName == null ? null : String(newName).trim();
+    if (newName != null && !cleanName) throw new Error('New name is blank.');
+    if (cleanName && cleanName !== item.name) {
+      const clash = this.targetList.items.find(i => i !== item && i.name.trim().toLowerCase() === cleanName.toLowerCase());
+      if (clash) {
+        throw new Error(`An item named "${clash.name}" is already on the list${clash.checked ? ' (checked off)' : ''}`);
+      }
+      item.name = cleanName;
+    }
+    if (notes != null) item.details = String(notes);
+    if (item._fieldsToUpdate?.length) await this._saveItem(item);
+    if (quantity != null) await this._setQuantity(item, quantity);
+    if (cleanName && cleanName.toLowerCase() !== String(itemName).toLowerCase()) {
+      await this._saveCategorizationRules(cleanName, (item.categoryAssignments || [])
+        .map(a => ({ groupId: a.categoryGroupId, categoryId: a.categoryId })));
+    }
+    return { name: item.name, quantity: item.quantity, notes: item.details || '' };
+  }
+
+  // Add a category to the list's main set, or with storeName, to that
+  // store's own set (an aisle, say), after the set's other categories.
+  async createCategory(name, storeName = null) {
+    if (!this.targetList) {
+      throw new Error('Not connected to any list. Call connect() first.');
+    }
+    const group = this._categoryGroupFor(storeName);
+    const cleanName = String(name || '').trim();
+    if (group && group.categories.some(c => c.name.trim().toLowerCase() === cleanName.toLowerCase())) {
+      throw new Error(`Category "${cleanName}" already exists in ${storeName ? `${this._requireStore(storeName).name}'s categories` : `list "${this.targetList.name}"`}`);
+    }
     const sortIndex = group ? group.categories.reduce((max, c) => Math.max(max, c.sortIndex ?? -1), -1) + 1 : 0;
-    return this.targetList.createCategory({ name, sortIndex });
+    return this.targetList.createCategory({ name: cleanName, categoryGroupId: group?.identifier, sortIndex });
   }
 
   // ===== PRICES =====

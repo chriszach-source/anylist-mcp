@@ -420,4 +420,59 @@ describe('shopping tool', () => {
       assert.ok(text.includes('Apples $1.39 (Trader Joes $1.99)'));
     });
   });
+  describe('update_item', () => {
+    it('says what it changed, resolving a partial name', async () => {
+      client._items.push({ name: 'Pearl River Dark Soy Sauce', notes: 'the big bottle' });
+      const result = await handlers.shopping({ action: 'update_item', name: 'dark soy', new_name: 'Dark Soy Sauce', quantity: 2, notes: '' });
+      assert.equal(result.content[0].text, 'Updated "Pearl River Dark Soy Sauce" on list "Test List": renamed to "Dark Soy Sauce", quantity 2, notes cleared');
+      assert.deepEqual(client._items[0], { name: 'Dark Soy Sauce', notes: '', quantity: 2 });
+    });
+
+    it('with nothing to change, says so and writes nothing', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'update_item', name: 'Milk' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes('Nothing to change'));
+      assert.deepEqual(client._items[0], { name: 'Milk' });
+    });
+  });
+
+  describe('a store\'s own categories', () => {
+    beforeEach(() => {
+      client._stores = [{ name: 'Costco' }, { name: 'Safeway' }];
+      client._storeCategories = { Costco: [{ name: 'Aisle 3', slug: 'aisle-3' }] };
+    });
+
+    it('list_categories with store_name lists that store\'s set', async () => {
+      const text = (await handlers.shopping({ action: 'list_categories', store_name: 'costco' })).content[0].text;
+      assert.ok(text.startsWith("costco's categories on"));
+      assert.ok(text.includes('- Aisle 3'));
+    });
+
+    it('set_item_category with store_name moves the item within the store\'s set', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_category', name: 'Milk', category: 'aisle 3', store_name: 'Costco' });
+      assert.ok(result.content[0].text.includes("Moved \"Milk\" to Aisle 3 in Costco's categories"));
+      assert.equal(client._items[0].storeCategory, 'Aisle 3');
+    });
+
+    it('set_item_category lists the store\'s categories when the name isn\'t one', async () => {
+      client._items.push({ name: 'Milk' });
+      const result = await handlers.shopping({ action: 'set_item_category', name: 'Milk', category: 'Dairy', store_name: 'Costco' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes("Category \"Dairy\" not found in Costco's categories. Available categories: Aisle 3"));
+    });
+
+    it('create_category with store_name adds an aisle to the store\'s set', async () => {
+      const result = await handlers.shopping({ action: 'create_category', name: 'Aisle 12', store_name: 'Costco' });
+      assert.ok(result.content[0].text.includes("Created category \"Aisle 12\" in Costco's categories"));
+      assert.deepEqual(client._storeCategories.Costco.map(c => c.name), ['Aisle 3', 'Aisle 12']);
+    });
+
+    it('explains when the store has no set of its own', async () => {
+      const result = await handlers.shopping({ action: 'list_categories', store_name: 'Safeway' });
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes("doesn't have its own category set"));
+    });
+  });
 });

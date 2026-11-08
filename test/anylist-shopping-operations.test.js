@@ -81,7 +81,17 @@ describe('AnyListClient shopping operations', () => {
       uid: 'user-1',
       client: http,
       lists: [list],
-      _userData: { shoppingListsResponse: { newLists: [rawList] } },
+      _userData: {
+        shoppingListsResponse: {
+          newLists: [rawList],
+          // Costco's store filter uses the Aisles set as Costco's own categories.
+          listResponses: [{ listId: 'list-1', storeFilters: [
+            { identifier: 'filter-costco', listId: 'list-1', name: 'Costco', storeIds: ['store-costco'], listCategoryGroupId: 'group-2' },
+            { identifier: 'filter-safeway', listId: 'list-1', name: 'Safeway', storeIds: ['store-safeway'], listCategoryGroupId: 'group-1' },
+          ] }],
+        },
+        listSettingsResponse: { settings: [] },
+      },
       createItem: (fields) => new (require('./item.js'))(fields, { client: http, protobuf: pb, uid: 'user-1' }),
     };
     client.targetList = list;
@@ -90,8 +100,8 @@ describe('AnyListClient shopping operations', () => {
   describe('categories', () => {
     it('lists categories by group, in AnyList order', () => {
       assert.deepEqual(client.getCategories(), [
-        { group: 'Grocery', categories: ['Dairy', 'Bulk Bins', 'Other'] },
-        { group: 'Aisles', categories: ['Aisle 3'] },
+        { group: 'Grocery', stores: [], categories: ['Dairy', 'Bulk Bins', 'Other'] },
+        { group: 'Aisles', stores: ['Costco'], categories: ['Aisle 3'] },
       ]);
     });
 
@@ -105,7 +115,7 @@ describe('AnyListClient shopping operations', () => {
     it('moves an item with the two operations AnyList Web sends, each carrying the whole item', async () => {
       const shownAs = await client.setItemCategory('Milk', 'Bulk Bins');
       assert.equal(shownAs, 'Bulk Bins');
-      assert.equal(posts.length, 1);
+      assert.equal(posts.length, 2, 'the move, then the categorization rule');
       assert.equal(posts[0].path, 'data/shopping-lists/update');
       const [assign, match] = decodeSentOperations(posts[0].body);
 
@@ -245,6 +255,153 @@ describe('AnyListClient shopping operations', () => {
     it('rejects a negative price without sending anything', async () => {
       await assert.rejects(client.setItemPrice('Milk', -1), /Invalid price/);
       assert.equal(posts.length, 0);
+    });
+  });
+  describe('categorization rules', () => {
+    const MILK_GROCERY_RULE = '6a6d394efafa5b4084f4669663ccafd2'; // Python uuid5(rule namespace, 'milk' + 'group-1' + 'list-1').hex
+
+    it('saves the rule after a move, so the category sticks the next time the item is added', async () => {
+      await client.setItemCategory('Milk', 'Dairy');
+      assert.equal(posts[1].path, 'data/shopping-lists/update-v2');
+      const [op] = decodeSentOperations(posts[1].body);
+      assert.equal(op.metadata.handlerId, 'save-categorization-rule');
+      assert.equal(op.metadata.operationClass, 5);
+      assert.equal(op.listId, 'list-1');
+      const rule = op.updatedCategorizationRule;
+      assert.equal(rule.identifier, MILK_GROCERY_RULE);
+      assert.equal(rule.listId, 'list-1');
+      assert.equal(rule.categoryGroupId, 'group-1');
+      assert.equal(rule.itemName, 'milk');
+      assert.equal(rule.categoryId, 'cat-dairy');
+    });
+
+    it('skips the rule when the list doesn\'t remember item categories', async () => {
+      client.client._userData.listSettingsResponse.settings = [{ identifier: 's', listId: 'list-1', shouldRememberItemCategories: false }];
+      await client.setItemCategory('Milk', 'Dairy');
+      assert.equal(posts.length, 1);
+    });
+  });
+
+  describe('a store\'s own category set', () => {
+    it('lists the store\'s categories', () => {
+      assert.deepEqual(client.getCategories('costco'), [{ group: 'Aisles', stores: ['Costco'], categories: ['Aisle 3'] }]);
+    });
+
+    it('moves an item within the store\'s set with only the assignment and that set\'s rule', async () => {
+      await client.createCategory('Aisle 12', 'Costco');
+      posts.length = 0;
+      const shownAs = await client.setItemCategory('Milk', 'aisle 12', 'Costco');
+      assert.equal(shownAs, 'Aisle 12');
+      const ops = decodeSentOperations(posts[0].body);
+      assert.deepEqual(ops.map(o => o.metadata.handlerId), ['update-list-item-category-assignment']);
+      const aisle12 = client.targetList.categoryGroups[1].categories.find(c => c.name === 'Aisle 12');
+      assert.deepEqual(
+        ops[0].listItem.categoryAssignments.map(a => [a.identifier, a.categoryGroupId, a.categoryId]),
+        [[GROUP_1_ASSIGNMENT_ID, 'group-1', 'cat-other'], ['cab031b41c2851239b2e4acfb2433f77', 'group-2', aisle12.identifier]],
+      );
+      assert.equal(ops[0].listItem.categoryMatchId, 'other', 'the main category is unchanged');
+      const [rule] = decodeSentOperations(posts[1].body);
+      assert.equal(rule.updatedCategorizationRule.categoryGroupId, 'group-2');
+      assert.equal(rule.updatedCategorizationRule.identifier, '27c5573c2d4a56fa8382fa649a9a7112');
+    });
+
+    it('adds an aisle to the store\'s set, after its other categories', async () => {
+      await client.createCategory('Aisle 12', 'Costco');
+      const [op] = decodeSentOperations(posts[0].body);
+      assert.equal(op.metadata.handlerId, 'create-category');
+      assert.equal(op.updatedCategory.categoryGroupId, 'group-2');
+      assert.equal(op.updatedCategory.name, 'Aisle 12');
+    });
+
+    it('doesn\'t find a store-set category without the store, or a main one with it', () => {
+      assert.equal(client.findCategory('Aisle 3'), null);
+      assert.equal(client.findCategory('Dairy', 'Costco'), null);
+    });
+
+    it('names an item\'s category from the store\'s set when the store is named', async () => {
+      assert.equal(client._categoryNameForItem(client.targetList.getItemByName('Milk'), 'Costco'), 'Aisle 3');
+      assert.equal(client._categoryNameForItem(client.targetList.getItemByName('Milk')), 'Other');
+    });
+
+    it('says when a store has no set of its own', async () => {
+      assert.throws(() => client.getCategories('Safeway'), /Safeway doesn't have its own category set/);
+      await assert.rejects(client.setItemCategory('Milk', 'Dairy', 'Safeway'), /doesn't have its own category set/);
+      assert.equal(posts.length, 0);
+    });
+
+    it('uses the category set the list\'s settings select as the main set', () => {
+      client.client._userData.listSettingsResponse.settings = [{ identifier: 's', listId: 'list-1', listCategoryGroupId: 'group-2' }];
+      assert.equal(client.findCategory('Aisle 3').category.identifier, 'cat-aisle-3');
+      assert.equal(client.findCategory('Dairy'), null);
+    });
+  });
+
+  describe('editing an item', () => {
+    it('renames, sets notes, and sets quantity with the v2 operation, carrying the categories to the new name', async () => {
+      const result = await client.updateItem('Milk', { newName: ' Whole Milk ', notes: 'organic', quantity: '2 gallons' });
+      assert.deepEqual(result, { name: 'Whole Milk', quantity: '2 gallons', notes: 'organic' });
+
+      const fields = decodeSentOperations(posts[0].body);
+      assert.deepEqual(fields.map(o => [o.metadata.handlerId, o.updatedValue]),
+        [['set-list-item-name', 'Whole Milk'], ['set-list-item-details', 'organic']]);
+
+      const [qty] = decodeSentOperations(posts[1].body);
+      assert.equal(qty.metadata.handlerId, 'set-list-item-quantity-v2');
+      assert.equal(qty.listItemId, 'item-milk');
+      assert.equal(qty.listItem.quantityPb.rawQuantity, '2 gallons');
+      assert.equal(qty.listItem.quantityPb.amount, '2');
+      assert.equal(qty.listItem.quantityPb.unit, 'gallons');
+      assert.equal(qty.listItem.deprecatedQuantity, '2 gallons');
+      assert.equal(qty.listItem.name, null, 'a partial item, so nothing else is overwritten');
+
+      const rules = decodeSentOperations(posts[2].body).map(o => o.updatedCategorizationRule);
+      assert.deepEqual(rules.map(r => [r.identifier, r.itemName, r.categoryGroupId, r.categoryId]), [
+        ['ed696e7ccb4854e58fed0866226d583b', 'whole milk', 'group-1', 'cat-other'],
+        ['4cd6f18fd0b0502eba5f051405d7a3c1', 'whole milk', 'group-2', 'cat-aisle-3'],
+      ]);
+    });
+
+    it('changes only what it\'s given, and a later save doesn\'t resend it', async () => {
+      await client.updateItem('Milk', { notes: '' });
+      await client.updateItem('Milk', { quantity: 3 });
+      assert.deepEqual(decodeSentOperations(posts[0].body).map(o => o.metadata.handlerId), ['set-list-item-details']);
+      assert.deepEqual(decodeSentOperations(posts[1].body).map(o => o.metadata.handlerId), ['set-list-item-quantity-v2']);
+      assert.equal(posts.length, 2);
+    });
+
+    it('refuses a name another item has, and writes nothing', async () => {
+      await assert.rejects(client.updateItem('Milk', { newName: 'oats', notes: 'x' }), /An item named "Oats" is already on the list/);
+      assert.equal(posts.length, 0);
+    });
+
+    it('sets an existing item\'s new quantity on add with the v2 operation', async () => {
+      await client.addItem('Oats', '2 lb');
+      const handlers = posts.flatMap(p => decodeSentOperations(p.body).map(o => o.metadata.handlerId));
+      assert.deepEqual(handlers, ['set-list-item-quantity-v2']);
+    });
+  });
+
+  describe('fresh lists', () => {
+    it('follows the list by ID when the library replaces its list objects', async () => {
+      const replacement = new List(decoded('ShoppingList', {
+        identifier: 'list-1', name: 'Grocery List',
+        items: [{ identifier: 'item-eggs', listId: 'list-1', name: 'Eggs' }],
+      }), { client: client.client.client, protobuf: pb, uid: 'user-1', stores: [] });
+      client.client.lists = [replacement];
+      assert.equal(client.targetList, replacement);
+      assert.deepEqual((await client.getItems()).map(i => i.name), ['Eggs']);
+    });
+
+    it('re-reads the lists when called again, but not twice within a few seconds', async () => {
+      let reads = 0;
+      client.client.getLists = async () => { reads++; };
+      client._username = 'u'; client._password = 'p';
+      await client.connect('Grocery List');
+      await client.connect('Grocery List');
+      assert.equal(reads, 1);
+      client._listsFetchedAt = Date.now() - 6000;
+      await client.connect('Grocery List');
+      assert.equal(reads, 2);
     });
   });
 });
