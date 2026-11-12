@@ -5,6 +5,14 @@ import { normalizeRecipe } from "../recipe-normalizer.js";
 
 const toMinutes = (seconds) => Math.round(seconds / 60);
 const toSeconds = (minutes) => Math.round(minutes * 60);
+// Store the photo in AnyList itself so it can't break; if that fails, keep the link and say so.
+const resolvePhoto = async (client, url) => {
+  try {
+    return { photoIds: [await client.uploadPhotoFromUrl(url)], photoUrls: [], warning: '' };
+  } catch (error) {
+    return { photoIds: [], photoUrls: [url], warning: ` (photo could not be uploaded to AnyList: ${error.message}; saved as a link instead)` };
+  }
+};
 const toIngredient = (i) => {
   if (i.heading) {
     return { name: i.name, quantity: null, note: null, isHeading: true, rawIngredient: i.name };
@@ -50,7 +58,7 @@ export function register(server, getClient) {
       cook_time: z.number().optional().describe("Cook time in minutes (create, update)"),
       servings: z.string().optional().describe("Servings, e.g. '4' or '4-6' (create, update)"),
       nutrition: z.string().optional().describe("Nutrition facts as plain text, one item per line, e.g. 'Calories: 65\\nFat: 4 g' (create, update). On update, pass an empty string to clear it."),
-      photo_url: z.string().optional().describe("URL of a recipe photo, such as the source page's main image (create, update). AnyList shows the image in its apps. On update, replaces the photo link; pass an empty string to clear it. Photos already stored in AnyList are kept."),
+      photo_url: z.string().optional().describe("URL of a recipe photo, such as the source page's main image (create, update). The server downloads the image and uploads it into AnyList's own photo storage, so the recipe keeps it even if the link later breaks; if the upload fails it is saved as a link and the reply says so. On update, replaces the recipe's photo; pass an empty string to remove it."),
       url: z.string().optional().describe("URL to import recipe from (import_url, normalize)"),
       text: z.string().optional().describe("Raw recipe text to parse (normalize only)"),
       save: z.boolean().optional().describe("If true, also save normalized recipe to AnyList (normalize only, default false)"),
@@ -119,6 +127,7 @@ export function register(server, getClient) {
             if (!confirmed) return textResponse(`Cancelled — recipe "${exactMatch.name}" was not overwritten.`);
             await client.deleteRecipe(exactMatch.name);
           }
+          const photo = photo_url ? await resolvePhoto(client, photo_url) : { photoIds: [], photoUrls: [], warning: '' };
           const result = await client.createRecipe({
             name: recipeName,
             ingredients: (ingredients || []).map(toIngredient),
@@ -129,10 +138,11 @@ export function register(server, getClient) {
             prepTime: prep_time ? toSeconds(prep_time) : null,
             cookTime: cook_time ? toSeconds(cook_time) : null,
             servings: servings || null,
-            photoUrls: photo_url ? [photo_url] : [],
+            photoIds: photo.photoIds,
+            photoUrls: photo.photoUrls,
             nutritionalInfo: nutrition || null,
           });
-          return textResponse(`Created recipe "${result.name}"`);
+          return textResponse(`Created recipe "${result.name}"${photo.warning}`);
         }
         case "update": {
           let updateRecipeName = name;
@@ -154,14 +164,20 @@ export function register(server, getClient) {
           if (prep_time !== undefined) fields.prepTime = toSeconds(prep_time);
           if (cook_time !== undefined) fields.cookTime = toSeconds(cook_time);
           if (servings !== undefined) fields.servings = servings;
-          if (photo_url !== undefined) fields.photoUrls = photo_url ? [photo_url] : [];
+          let photoWarning = '';
+          if (photo_url !== undefined) {
+            const photo = photo_url ? await resolvePhoto(client, photo_url) : { photoIds: [], photoUrls: [], warning: '' };
+            fields.photoIds = photo.photoIds;
+            fields.photoUrls = photo.photoUrls;
+            photoWarning = photo.warning;
+          }
           if (nutrition !== undefined) fields.nutritionalInfo = nutrition || null;
           if (Object.keys(fields).length === 0) {
             return errorResponse('Action "update" requires at least one field to change (new_name, ingredients, steps, note, source_name, source_url, prep_time, cook_time, servings, photo_url, or nutrition).');
           }
           const updated = await client.updateRecipe(updateRecipeName, fields);
-          if (fields.name !== undefined) return textResponse(`Renamed recipe "${updateRecipeName}" to "${updated.name}"`);
-          return textResponse(`Updated recipe "${updated.name}"`);
+          if (fields.name !== undefined) return textResponse(`Renamed recipe "${updateRecipeName}" to "${updated.name}"${photoWarning}`);
+          return textResponse(`Updated recipe "${updated.name}"${photoWarning}`);
         }
         case "delete": {
           let deleteRecipeName = name;
