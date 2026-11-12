@@ -530,7 +530,7 @@ class AnyListClient {
     }
   }
 
-  async createRecipe({ name, ingredients = [], preparationSteps = [], note = null, sourceName = null, sourceUrl = null, prepTime = null, cookTime = null, servings = null, photoUrls = [], nutritionalInfo = null }) {
+  async createRecipe({ name, ingredients = [], preparationSteps = [], note = null, sourceName = null, sourceUrl = null, prepTime = null, cookTime = null, servings = null, photoIds = [], photoUrls = [], nutritionalInfo = null }) {
     if (!this.client) {
       throw new Error('Not connected. Call connect() first.');
     }
@@ -543,6 +543,7 @@ class AnyListClient {
       if (prepTime) recipeObj.prepTime = prepTime;
       if (cookTime) recipeObj.cookTime = cookTime;
       if (servings) recipeObj.servings = servings;
+      if (photoIds.length > 0) recipeObj.photoIds = photoIds;
       if (photoUrls.length > 0) recipeObj.photoUrls = photoUrls;
       if (nutritionalInfo) recipeObj.nutritionalInfo = nutritionalInfo;
       if (preparationSteps.length > 0) recipeObj.preparationSteps = preparationSteps;
@@ -562,6 +563,42 @@ class AnyListClient {
     } catch (error) {
       throw new Error(`Failed to create recipe: ${error.message}`);
     }
+  }
+
+  /**
+   * Download an image and store it in AnyList's own photo storage, so the
+   * recipe keeps its photo even if the source link later breaks. Endpoint and
+   * form fields follow anylist_rs: POST data/photos/upload with `filename`
+   * ("<photoId>.jpg") and the image bytes in `photo`.
+   *
+   * @param {string} url - image URL to download
+   * @returns {Promise<string>} the new photo id, for a recipe's photoIds
+   */
+  async uploadPhotoFromUrl(url) {
+    if (!this.client) {
+      throw new Error('Not connected. Call connect() first.');
+    }
+    // Browser-like User-Agent: many recipe-site CDNs refuse Node's default.
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15' },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) {
+      throw new Error(`image download failed (HTTP ${response.status})`);
+    }
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) {
+      throw new Error(`URL is not an image (content type "${contentType || 'unknown'}")`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const photoId = uuid();
+    const filename = `${photoId}.jpg`;
+    const form = new FormData();
+    form.append('filename', filename);
+    form.append('photo', bytes, { filename, contentType });
+    await this.client.client.post('data/photos/upload', { body: form });
+    console.error(`Uploaded photo ${photoId} (${bytes.length} bytes) from ${url}`);
+    return photoId;
   }
 
   /**
@@ -623,7 +660,7 @@ class AnyListClient {
         ingredients: existing.ingredients.map(i => i.toJSON()),
       };
 
-      for (const key of ['name', 'note', 'sourceName', 'sourceUrl', 'prepTime', 'cookTime', 'servings', 'preparationSteps', 'photoUrls', 'nutritionalInfo']) {
+      for (const key of ['name', 'note', 'sourceName', 'sourceUrl', 'prepTime', 'cookTime', 'servings', 'preparationSteps', 'photoIds', 'photoUrls', 'nutritionalInfo']) {
         if (fields[key] !== undefined) merged[key] = fields[key];
       }
       if (fields.ingredients !== undefined) {

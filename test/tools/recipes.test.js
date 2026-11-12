@@ -154,9 +154,21 @@ describe('recipes tool', () => {
       assert.equal(client._recipes[0].nutritionalInfo, 'Calories: 65\nFat: 4 g');
     });
 
-    it('stores a photo URL', async () => {
-      await handlers.recipes({ action: 'create', name: 'Pictured', photo_url: 'https://example.com/a.jpg' });
+    it('uploads the photo into AnyList', async () => {
+      const result = await handlers.recipes({ action: 'create', name: 'Pictured', photo_url: 'https://example.com/a.jpg' });
+      assert.deepEqual(client._uploadedPhotos, ['https://example.com/a.jpg']);
+      assert.deepEqual(client._recipes[0].photoIds, ['photo-1']);
+      assert.deepEqual(client._recipes[0].photoUrls, []);
+      assert.equal(result.content[0].text, 'Created recipe "Pictured"');
+    });
+
+    it('falls back to a photo link when the upload fails', async () => {
+      client._photoUploadError = 'image download failed (HTTP 403)';
+      const result = await handlers.recipes({ action: 'create', name: 'Pictured', photo_url: 'https://example.com/a.jpg' });
+      assert.deepEqual(client._recipes[0].photoIds, []);
       assert.deepEqual(client._recipes[0].photoUrls, ['https://example.com/a.jpg']);
+      assert.ok(result.content[0].text.includes('saved as a link instead'));
+      assert.ok(result.content[0].text.includes('HTTP 403'));
     });
 
     it('stores prep/cook times in seconds', async () => {
@@ -281,11 +293,14 @@ describe('recipes tool', () => {
     });
 
     it('sets and clears the photo on update', async () => {
-      client._recipes.push({ identifier: 'r-p', name: 'Soup', photoUrls: ['https://example.com/old.jpg'] });
+      client._recipes.push({ identifier: 'r-p', name: 'Soup', photoIds: ['old-id'], photoUrls: ['https://example.com/old.jpg'] });
       await handlers.recipes({ action: 'update', name: 'Soup', photo_url: 'https://example.com/new.jpg' });
-      assert.deepEqual(client._recipes[0].photoUrls, ['https://example.com/new.jpg']);
-      await handlers.recipes({ action: 'update', name: 'Soup', photo_url: '' });
+      assert.deepEqual(client._recipes[0].photoIds, ['photo-1']);
       assert.deepEqual(client._recipes[0].photoUrls, []);
+      await handlers.recipes({ action: 'update', name: 'Soup', photo_url: '' });
+      assert.deepEqual(client._recipes[0].photoIds, []);
+      assert.deepEqual(client._recipes[0].photoUrls, []);
+      assert.equal(client._uploadedPhotos.length, 1);
     });
 
     it('keeps ingredient notes on update', async () => {

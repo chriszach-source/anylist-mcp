@@ -130,6 +130,12 @@ export class MockAnyListClient {
     return { ...r, ingredients: r.ingredients || [], preparationSteps: r.preparationSteps || [] };
   }
 
+  async uploadPhotoFromUrl(url) {
+    if (this._photoUploadError) throw new Error(this._photoUploadError);
+    this._uploadedPhotos = [...(this._uploadedPhotos || []), url];
+    return `photo-${this._uploadedPhotos.length}`;
+  }
+
   async createRecipe(opts) {
     this._recipes.push(opts);
     return { identifier: 'r-1', name: opts.name };
