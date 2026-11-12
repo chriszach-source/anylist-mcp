@@ -540,6 +540,33 @@ try {
     return 'renamed back, id stable';
   });
 
+  // Recipes: photo_url is uploaded into AnyList's photo storage, not kept as a link.
+  // GitHub's own org avatar is a small, long-lived PNG.
+  const testPhotoUrl = 'https://avatars.githubusercontent.com/u/9919?s=200&v=4';
+  await test(`recipes → update with photo_url uploads the photo into AnyList`, async () => {
+    const r = await client.callTool({ name: 'recipes', arguments: { action: 'update', name: testRecipe, photo_url: testPhotoUrl } });
+    const text = r.content[0].text;
+    if (r.isError) throw new Error(text);
+    if (text.includes('could not be uploaded')) throw new Error(`upload fell back to a link: ${text}`);
+    await new Promise(res => setTimeout(res, 2000));
+    const details = await getRecipeText(testRecipe);
+    if (!details.includes('Photos: 1 stored in AnyList')) throw new Error(`expected 1 stored photo:\n${details}`);
+    if (details.includes('Photo links:')) throw new Error(`photo link kept alongside the stored photo:\n${details}`);
+    return '1 photo stored, no link';
+  });
+
+  await test(`recipes → photo_url that isn't an image falls back to a link with a warning`, async () => {
+    const r = await client.callTool({ name: 'recipes', arguments: { action: 'update', name: testRecipe, photo_url: 'https://example.com/' } });
+    const text = r.content[0].text;
+    if (r.isError) throw new Error(text);
+    if (!text.includes('saved as a link instead')) throw new Error(`expected a fallback warning, got: ${text}`);
+    await new Promise(res => setTimeout(res, 2000));
+    const details = await getRecipeText(testRecipe);
+    if (!details.includes('Photo links: https://example.com/')) throw new Error(`expected the link to be saved:\n${details}`);
+    if (details.includes('stored in AnyList')) throw new Error(`stored photo not replaced:\n${details}`);
+    return 'link saved with warning; stored photo replaced';
+  });
+
   await test(`recipes → delete ("${testRecipe}")`, async () => {
     const r = await client.callTool({ name: 'recipes', arguments: { action: 'delete', name: testRecipe } });
     const text = r.content[0].text;
